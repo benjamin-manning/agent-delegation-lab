@@ -41,6 +41,15 @@ def _extract_choices(results) -> dict[str, str]:
     return choices
 
 
+def _require_answers(choices: dict[str, str]) -> None:
+    """Raise if the model answered none of the questions."""
+    if all(v is None for v in choices.values()):
+        raise RuntimeError(
+            "The model returned no answers. Check that EXPECTED_PARROT_API_KEY "
+            "is set in the app's secrets."
+        )
+
+
 def run_session(agent, model=None, n_sims: int = 1000) -> dict:
     """Run one agent through all 8 decisions, simulate payoffs.
 
@@ -61,6 +70,7 @@ def run_session(agent, model=None, n_sims: int = 1000) -> dict:
     )
 
     choices = _extract_choices(results)
+    _require_answers(choices)
     simulation = simulate_session(choices, n_sims=n_sims)
 
     return {
@@ -110,6 +120,7 @@ def run_preview(
     )
 
     choices = _extract_choices_from(results, problems)
+    _require_answers(choices)
     simulation = simulate_preview(choices, problems, n_sims=n_sims)
 
     return {

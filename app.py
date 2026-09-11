@@ -212,7 +212,8 @@ if not st.session_state.committed:
                             st.session_state.budget_remaining += (
                                 PREVIEW_COST_PRESET
                             )
-                    st.rerun()
+                        else:
+                            st.rerun()
                 if not can_afford:
                     st.caption("Not enough budget")
 
@@ -280,7 +281,8 @@ if not st.session_state.committed:
             except Exception as exc:
                 st.error(f"Preview failed: {exc}")
                 st.session_state.budget_remaining += PREVIEW_COST_CUSTOM
-        st.rerun()
+            else:
+                st.rerun()
 
     # ---- Show preview results ----
     if st.session_state.preview_history:
