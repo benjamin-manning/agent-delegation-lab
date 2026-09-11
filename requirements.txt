@@ -1,4 +1,4 @@
-edsl
-streamlit
-matplotlib
-numpy
+edsl==1.0.8
+streamlit==1.63.0
+matplotlib==3.11.1
+numpy==2.5.3

@@ -4,7 +4,9 @@ A platform where you pre-commit to an AI agent, then watch it face 8 economic de
 
 ## Setup
 
-1. Install dependencies:
+1. Use Python 3.12. EDSL does not run on Python 3.14. On Streamlit Cloud, pick the Python version under Advanced settings when you deploy.
+
+   Install dependencies:
    ```
    pip install -r requirements.txt
    ```
