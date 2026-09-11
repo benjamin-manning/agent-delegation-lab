@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 
 os.environ.setdefault("EDSL_API_TIMEOUT", "120")
 
-from edsl import Model
+from edsl import Coop, Model
 
 from decisions import (
     DECISIONS,
@@ -41,13 +42,37 @@ def _extract_choices(results) -> dict[str, str]:
     return choices
 
 
+@lru_cache(maxsize=1)
+def _require_remote_inference() -> None:
+    """Raise with the real reason if Expected Parrot remote inference is unavailable.
+
+    Without this, EDSL silently falls back to local inference, which fails
+    with "No key found for service 'openai'".
+    """
+    key = os.environ.get("EXPECTED_PARROT_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "EXPECTED_PARROT_API_KEY is not set. Add it under the app's "
+            "Settings > Secrets."
+        )
+    try:
+        settings = Coop(api_key=key).edsl_settings
+    except Exception as exc:
+        reason = str(exc).strip().splitlines()[0]
+        raise RuntimeError(
+            f"Expected Parrot remote inference is unavailable "
+            f"(key length {len(key)}): {reason}"
+        ) from exc
+    if not settings.get("remote_inference", False):
+        raise RuntimeError(
+            "Remote inference is turned off for this Expected Parrot account."
+        )
+
+
 def _require_answers(choices: dict[str, str]) -> None:
     """Raise if the model answered none of the questions."""
     if all(v is None for v in choices.values()):
-        raise RuntimeError(
-            "The model returned no answers. Check that EXPECTED_PARROT_API_KEY "
-            "is set in the app's secrets."
-        )
+        raise RuntimeError("The model returned no answers to any question.")
 
 
 def run_session(agent, model=None, n_sims: int = 1000) -> dict:
@@ -59,6 +84,7 @@ def run_session(agent, model=None, n_sims: int = 1000) -> dict:
             "simulation": {per_problem: [...], total_payoffs: [...]},
         }
     """
+    _require_remote_inference()
     model = model or get_model()
     survey = build_survey()
 
@@ -109,6 +135,7 @@ def run_preview(
             "n_problems": int,
         }
     """
+    _require_remote_inference()
     model = model or get_model()
     survey = build_preview_survey(problems)
 
