@@ -13,6 +13,7 @@ A platform where you pre-commit to an AI agent, then watch it face 8 economic de
    ```
    export EXPECTED_PARROT_API_KEY="your-key-here"
    ```
+   On Streamlit Cloud, add `EXPECTED_PARROT_API_KEY = "your-key-here"` under the app's Settings > Secrets.
 
 3. Run the app:
    ```

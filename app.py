@@ -9,8 +9,19 @@ Launch:  streamlit run app.py
 
 from __future__ import annotations
 
-import streamlit as st
+import os
 import random
+
+import streamlit as st
+
+# Streamlit Cloud stores the key in st.secrets; EDSL reads it from the environment.
+# Must run before any module that imports edsl.
+try:
+    os.environ.setdefault(
+        "EXPECTED_PARROT_API_KEY", st.secrets["EXPECTED_PARROT_API_KEY"]
+    )
+except Exception:
+    pass
 
 from agents import PRESETS, create_agent
 from decisions import (
