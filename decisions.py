@@ -1,8 +1,9 @@
-"""Bank of decision problems and payoff simulation.
+"""Target decision problems and payoff simulation.
 
-Each problem is a binary (or ternary) choice between options with specified
-probability distributions.  After the agent picks, we simulate the realized
-payoff by drawing from the chosen option's distribution.
+Each problem is a choice between options, and each option is a lottery with
+stated probabilities. Three of the 8 targets are simple two-option choices;
+the rest have more outcomes, more options, or unknown odds. After the agent
+picks, we draw the payoff from the chosen option's lottery.
 """
 
 from __future__ import annotations
@@ -18,9 +19,10 @@ from edsl import Survey, QuestionMultipleChoice
 
 @dataclass
 class Outcome:
-    """One branch of a lottery: probability * payoff."""
+    """One branch of a lottery: probability * payoff, optionally named (e.g. "Boom")."""
     probability: float
     payoff: float
+    label: str = ""
 
 
 @dataclass
@@ -33,15 +35,19 @@ class Option:
     def expected_value(self) -> float:
         return sum(o.probability * o.payoff for o in self.outcomes)
 
-    def simulate(self) -> float:
-        """Draw one realization from this lottery."""
+    def draw(self) -> Outcome:
+        """Draw one outcome from this lottery."""
         r = random.random()
         cumulative = 0.0
         for o in self.outcomes:
             cumulative += o.probability
             if r < cumulative:
-                return o.payoff
-        return self.outcomes[-1].payoff  # rounding safety
+                return o
+        return self.outcomes[-1]  # rounding safety
+
+    def simulate(self) -> float:
+        """Draw one payoff from this lottery."""
+        return self.draw().payoff
 
 
 @dataclass
@@ -70,7 +76,7 @@ class Decision:
 
 
 # ------------------------------------------------------------------
-# The decision bank
+# The 8 target decisions
 # ------------------------------------------------------------------
 
 DECISIONS: list[Decision] = [
@@ -135,122 +141,197 @@ DECISIONS: list[Decision] = [
         ],
     ),
 
-    # 4. Insurance
+    # 4. Two lotteries: similar expected value, opposite skew
     Decision(
-        name="insurance",
+        name="two_lotteries",
+        category="Risk",
+        title="Two Lotteries",
+        description=(
+            "You face a choice between two lotteries.\n\n"
+            "Lottery A: 10% chance of $0, 20% chance of $4.00, 40% chance of "
+            "$6.00, 30% chance of $7.00.\n"
+            "Lottery B: 30% chance of $3.00, 40% chance of $4.00, 20% chance "
+            "of $6.00, 10% chance of $17.00.\n\n"
+            "Which do you choose?"
+        ),
+        options=[
+            Option("Lottery A: 10% $0 / 20% $4 / 40% $6 / 30% $7", [
+                Outcome(0.1, 0.0),
+                Outcome(0.2, 4.0),
+                Outcome(0.4, 6.0),
+                Outcome(0.3, 7.0),
+            ]),
+            Option("Lottery B: 30% $3 / 40% $4 / 20% $6 / 10% $17", [
+                Outcome(0.3, 3.0),
+                Outcome(0.4, 4.0),
+                Outcome(0.2, 6.0),
+                Outcome(0.1, 17.0),
+            ]),
+        ],
+    ),
+
+    # 5. Coin flip menu: six gambles from safe to risky
+    Decision(
+        name="coin_menu",
+        category="Risk",
+        title="Coin Flip Menu",
+        description=(
+            "A coin will be flipped. Choose one of six gambles. Each gamble "
+            "pays one amount if the coin lands heads and another amount if it "
+            "lands tails.\n\n"
+            "Gamble 1: $6.00 if heads, $6.00 if tails.\n"
+            "Gamble 2: $8.00 if heads, $5.00 if tails.\n"
+            "Gamble 3: $10.00 if heads, $4.00 if tails.\n"
+            "Gamble 4: $12.00 if heads, $3.00 if tails.\n"
+            "Gamble 5: $14.00 if heads, $2.00 if tails.\n"
+            "Gamble 6: $15.00 if heads, $0 if tails.\n\n"
+            "Which gamble do you choose?"
+        ),
+        options=[
+            Option("Gamble 1: $6 heads / $6 tails", [
+                Outcome(0.5, 6.0, "Heads"),
+                Outcome(0.5, 6.0, "Tails"),
+            ]),
+            Option("Gamble 2: $8 heads / $5 tails", [
+                Outcome(0.5, 8.0, "Heads"),
+                Outcome(0.5, 5.0, "Tails"),
+            ]),
+            Option("Gamble 3: $10 heads / $4 tails", [
+                Outcome(0.5, 10.0, "Heads"),
+                Outcome(0.5, 4.0, "Tails"),
+            ]),
+            Option("Gamble 4: $12 heads / $3 tails", [
+                Outcome(0.5, 12.0, "Heads"),
+                Outcome(0.5, 3.0, "Tails"),
+            ]),
+            Option("Gamble 5: $14 heads / $2 tails", [
+                Outcome(0.5, 14.0, "Heads"),
+                Outcome(0.5, 2.0, "Tails"),
+            ]),
+            Option("Gamble 6: $15 heads / $0 tails", [
+                Outcome(0.5, 15.0, "Heads"),
+                Outcome(0.5, 0.0, "Tails"),
+            ]),
+        ],
+    ),
+
+    # 6. Insurance plans: three accident outcomes, four plans
+    Decision(
+        name="insurance_plans",
         category="Insurance",
-        title="Insurance Decision",
+        title="Insurance Plans",
         description=(
-            "You have $20.00. There is a 15% chance that an accident "
-            "occurs and you lose $15.00.\n\n"
-            "Option A: Buy insurance for $3.00. You are guaranteed to "
-            "keep $17.00 regardless of what happens.\n"
-            "Option B: No insurance. 85% chance you keep $20.00, "
-            "15% chance you end up with $5.00.\n\n"
-            "Which do you choose?"
+            "You have $20.00. This year there is an 80% chance of no accident, "
+            "a 15% chance of a minor accident that costs you $6.00, and a 5% "
+            "chance of a major accident that costs you $18.00.\n\n"
+            "Plan A (No insurance): Costs nothing. You pay for any accident "
+            "yourself.\n"
+            "Plan B (High deductible): Costs $0.50. You pay the first $6.00 of "
+            "any accident, and the plan pays the rest.\n"
+            "Plan C (Low deductible): Costs $1.50. You pay the first $2.00 of "
+            "any accident, and the plan pays the rest.\n"
+            "Plan D (Full coverage): Costs $3.00. The plan pays for any "
+            "accident.\n\n"
+            "Which plan do you choose?"
         ),
         options=[
-            Option("Option A: Buy insurance (keep $17.00)", [
-                Outcome(1.0, 17.00),
+            Option("Plan A: No insurance", [
+                Outcome(0.8, 20.0, "No accident"),
+                Outcome(0.15, 14.0, "Minor accident"),
+                Outcome(0.05, 2.0, "Major accident"),
             ]),
-            Option("Option B: No insurance (85% $20 / 15% $5)", [
-                Outcome(0.85, 20.00), Outcome(0.15, 5.00),
+            Option("Plan B: High deductible ($0.50)", [
+                Outcome(0.8, 19.5, "No accident"),
+                Outcome(0.15, 13.5, "Minor accident"),
+                Outcome(0.05, 13.5, "Major accident"),
+            ]),
+            Option("Plan C: Low deductible ($1.50)", [
+                Outcome(0.8, 18.5, "No accident"),
+                Outcome(0.15, 16.5, "Minor accident"),
+                Outcome(0.05, 16.5, "Major accident"),
+            ]),
+            Option("Plan D: Full coverage ($3.00)", [
+                Outcome(0.8, 17.0, "No accident"),
+                Outcome(0.15, 17.0, "Minor accident"),
+                Outcome(0.05, 17.0, "Major accident"),
             ]),
         ],
     ),
 
-    # 5. Ambiguity (Ellsberg-style)
+    # 7. Three-color urn: bets that mix known and unknown odds
     Decision(
-        name="ambiguity",
+        name="three_color_urn",
         category="Ambiguity",
-        title="Known vs. Unknown Odds",
+        title="Three-Color Urn",
         description=(
-            "Two urns each contain 100 balls, red and blue. "
-            "You will draw one ball. If it is red, you win $10.00. "
-            "If blue, you win $0.\n\n"
-            "Urn A: You know it contains exactly 50 red and 50 blue balls.\n"
-            "Urn B: It contains some mix of red and blue balls, but you "
-            "do not know the ratio.\n\n"
-            "Which urn do you draw from?"
+            "An urn contains 90 balls. 30 of them are red. The other 60 are "
+            "black and yellow, but you do not know how many are black and how "
+            "many are yellow. You will draw one ball.\n\n"
+            "Bet A: You win $15.00 if the ball is red.\n"
+            "Bet B: You win $15.00 if the ball is black.\n"
+            "Bet C: You win $7.50 if the ball is black or yellow.\n"
+            "Bet D: You win $7.50 if the ball is red or yellow.\n\n"
+            "Which bet do you choose?"
         ),
         options=[
-            Option("Urn A: Known 50/50", [
-                Outcome(0.5, 10.00), Outcome(0.5, 0.00),
+            Option("Bet A: $15 if red", [
+                Outcome(1 / 3, 15.0, "Red ball"),
+                Outcome(2 / 3, 0.0, "Black or yellow ball"),
             ]),
-            # For simulation, we draw the unknown ratio uniformly,
-            # making it 50/50 in expectation but with more variance
-            Option("Urn B: Unknown ratio", [
-                Outcome(0.5, 10.00), Outcome(0.5, 0.00),
+            Option("Bet B: $15 if black", [
+                Outcome(1 / 3, 15.0, "Black ball"),
+                Outcome(2 / 3, 0.0, "Red or yellow ball"),
+            ]),
+            Option("Bet C: $7.50 if black or yellow", [
+                Outcome(2 / 3, 7.5, "Black or yellow ball"),
+                Outcome(1 / 3, 0.0, "Red ball"),
+            ]),
+            Option("Bet D: $7.50 if red or yellow", [
+                Outcome(2 / 3, 7.5, "Red or yellow ball"),
+                Outcome(1 / 3, 0.0, "Black ball"),
             ]),
         ],
     ),
 
-    # 6. Moderate lottery
+    # 8. Market scenarios: four funds across three market outcomes
     Decision(
-        name="moderate_lottery",
-        category="Risk",
-        title="Steady vs. Volatile",
-        description=(
-            "You face a choice between two options.\n\n"
-            "Option A: 80% chance of $4.00, 20% chance of $1.00.\n"
-            "Option B: 40% chance of $10.00, 60% chance of $0.\n\n"
-            "Which do you choose?"
-        ),
-        options=[
-            Option("Option A: 80% $4 / 20% $1", [
-                Outcome(0.8, 4.00), Outcome(0.2, 1.00),
-            ]),
-            Option("Option B: 40% $10 / 60% $0", [
-                Outcome(0.4, 10.00), Outcome(0.6, 0.00),
-            ]),
-        ],
-    ),
-
-    # 7. Three-way split
-    Decision(
-        name="three_way",
-        category="Risk",
-        title="Three Outcomes",
-        description=(
-            "You face a choice between two options.\n\n"
-            "Option A: Receive $5.00 for certain.\n"
-            "Option B: Equal chances (one-third each) of receiving "
-            "$15.00, $3.00, or $0.\n\n"
-            "Which do you choose?"
-        ),
-        options=[
-            Option("Option A: $5.00 for certain", [Outcome(1.0, 5.00)]),
-            Option("Option B: 1/3 each of $15, $3, or $0", [
-                Outcome(1 / 3, 15.00),
-                Outcome(1 / 3, 3.00),
-                Outcome(1 / 3, 0.00),
-            ]),
-        ],
-    ),
-
-    # 8. Investment allocation
-    Decision(
-        name="investment",
+        name="market_scenarios",
         category="Investment",
-        title="Investment Choice",
+        title="Market Scenarios",
         description=(
-            "You have $10.00 to invest in one of three funds.\n\n"
-            "Fund A (Safe): Guaranteed return -- you end with $12.00.\n"
-            "Fund B (Moderate): 50% chance you end with $18.00, "
-            "50% chance you end with $7.00.\n"
-            "Fund C (Aggressive): 30% chance you end with $30.00, "
-            "70% chance you end with $5.00.\n\n"
+            "You have $10.00 to invest in one of four funds. Next year there "
+            "is a 25% chance of a boom, a 50% chance of a normal year, and a "
+            "25% chance of a recession. What you end with depends on the fund "
+            "and on the market.\n\n"
+            "Fund A (Cash): You end with $10.50 in every case.\n"
+            "Fund B (Bonds): You end with $13.00 in a boom, $11.50 in a normal "
+            "year, and $9.00 in a recession.\n"
+            "Fund C (Stocks): You end with $18.00 in a boom, $12.00 in a "
+            "normal year, and $5.00 in a recession.\n"
+            "Fund D (Startup): You end with $34.00 in a boom, $8.00 in a "
+            "normal year, and $0 in a recession.\n\n"
             "Which fund do you choose?"
         ),
         options=[
-            Option("Fund A: Safe ($12.00 guaranteed)", [
-                Outcome(1.0, 12.00),
+            Option("Fund A: Cash ($10.50 always)", [
+                Outcome(0.25, 10.5, "Boom"),
+                Outcome(0.5, 10.5, "Normal year"),
+                Outcome(0.25, 10.5, "Recession"),
             ]),
-            Option("Fund B: Moderate (50/50 $18 or $7)", [
-                Outcome(0.5, 18.00), Outcome(0.5, 7.00),
+            Option("Fund B: Bonds ($13 / $11.50 / $9)", [
+                Outcome(0.25, 13.0, "Boom"),
+                Outcome(0.5, 11.5, "Normal year"),
+                Outcome(0.25, 9.0, "Recession"),
             ]),
-            Option("Fund C: Aggressive (30/70 $30 or $5)", [
-                Outcome(0.3, 30.00), Outcome(0.7, 5.00),
+            Option("Fund C: Stocks ($18 / $12 / $5)", [
+                Outcome(0.25, 18.0, "Boom"),
+                Outcome(0.5, 12.0, "Normal year"),
+                Outcome(0.25, 5.0, "Recession"),
+            ]),
+            Option("Fund D: Startup ($34 / $8 / $0)", [
+                Outcome(0.25, 34.0, "Boom"),
+                Outcome(0.5, 8.0, "Normal year"),
+                Outcome(0.25, 0.0, "Recession"),
             ]),
         ],
     ),
@@ -273,504 +354,92 @@ def build_survey() -> Survey:
     return Survey(questions)
 
 
-def simulate_session(choices: dict[str, str], n_sims: int = 1000) -> dict:
-    """Given agent choices {question_name: chosen_label}, simulate payoffs.
-
-    Returns dict with:
-      - per_problem: [{name, title, category, chosen, ev, simulated_payoffs}, ...]
-      - total_payoffs: [sum_of_8_payoffs for each of n_sims simulations]
-    """
-    per_problem = []
-    # For each simulation run, we'll accumulate total
-    total_payoffs = [0.0] * n_sims
-
-    for decision in DECISIONS:
-        chosen_label = choices.get(decision.name)
-        if chosen_label is None:
-            # Agent didn't answer this question
-            per_problem.append({
-                "name": decision.name,
-                "title": decision.title,
-                "category": decision.category,
-                "chosen": "No answer",
-                "ev": 0,
-                "simulated_payoffs": [0.0] * n_sims,
-            })
-            continue
-
-        # Find the chosen option
-        chosen_option = None
-        for opt in decision.options:
-            if opt.label == chosen_label:
-                chosen_option = opt
-                break
-
-        if chosen_option is None:
-            # Try partial match (agent might abbreviate)
-            for opt in decision.options:
-                if chosen_label in opt.label or opt.label in chosen_label:
-                    chosen_option = opt
-                    break
-
-        if chosen_option is None:
-            chosen_option = decision.options[0]  # fallback
-
-        payoffs = chosen_option.simulate() if n_sims == 1 else [
-            chosen_option.simulate() for _ in range(n_sims)
-        ]
-        if n_sims == 1:
-            payoffs = [payoffs]
-
-        for i in range(n_sims):
-            total_payoffs[i] += payoffs[i]
-
-        per_problem.append({
-            "name": decision.name,
-            "title": decision.title,
-            "category": decision.category,
-            "chosen": chosen_label,
-            "ev": chosen_option.expected_value,
-            "simulated_payoffs": payoffs,
-        })
-
-    return {
-        "per_problem": per_problem,
-        "total_payoffs": total_payoffs,
-    }
-
-
-# ------------------------------------------------------------------
-# Preview decision bank (never used in the real run)
-# ------------------------------------------------------------------
-
-PREVIEW_DECISIONS: list[Decision] = [
-    # ---- Risk (3 preview problems) ----
-    Decision(
-        name="preview_risk_double_or_nothing",
-        category="Risk",
-        title="Double or Nothing",
-        description=(
-            "You face a choice between two options.\n\n"
-            "Option A: Receive $4.00 for certain.\n"
-            "Option B: A coin flip -- 50% chance of receiving $10.00, "
-            "50% chance of receiving $0.\n\n"
-            "Which do you choose?"
-        ),
-        options=[
-            Option("Option A: $4.00 for certain", [Outcome(1.0, 4.00)]),
-            Option("Option B: 50/50 for $10.00 or $0", [
-                Outcome(0.5, 10.00), Outcome(0.5, 0.00),
-            ]),
-        ],
-    ),
-    Decision(
-        name="preview_risk_small_edge",
-        category="Risk",
-        title="Small Edge",
-        description=(
-            "You face a choice between two options.\n\n"
-            "Option A: Receive $4.50 for certain.\n"
-            "Option B: 70% chance of $6.00, 30% chance of $1.00.\n\n"
-            "Which do you choose?"
-        ),
-        options=[
-            Option("Option A: $4.50 for certain", [Outcome(1.0, 4.50)]),
-            Option("Option B: 70% $6 / 30% $1", [
-                Outcome(0.7, 6.00), Outcome(0.3, 1.00),
-            ]),
-        ],
-    ),
-    Decision(
-        name="preview_risk_high_variance",
-        category="Risk",
-        title="High Variance Gamble",
-        description=(
-            "You face a choice between two options.\n\n"
-            "Option A: Receive $5.50 for certain.\n"
-            "Option B: 20% chance of $25.00, 80% chance of $1.00.\n\n"
-            "Which do you choose?"
-        ),
-        options=[
-            Option("Option A: $5.50 for certain", [Outcome(1.0, 5.50)]),
-            Option("Option B: 20% $25 / 80% $1", [
-                Outcome(0.2, 25.00), Outcome(0.8, 1.00),
-            ]),
-        ],
-    ),
-
-    # ---- Loss (3 preview problems) ----
-    Decision(
-        name="preview_loss_protect_gains",
-        category="Loss",
-        title="Protect Your Gains",
-        description=(
-            "You currently have $12.00 in hand.\n\n"
-            "Option A: Keep your $12.00. No risk.\n"
-            "Option B: A gamble -- 50% chance your total becomes $18.00 "
-            "(gain $6), but a 50% chance your total becomes $6.00 "
-            "(lose $6).\n\n"
-            "Which do you choose?"
-        ),
-        options=[
-            Option("Option A: Keep $12.00", [Outcome(1.0, 12.00)]),
-            Option("Option B: Gamble (50% $18 / 50% $6)", [
-                Outcome(0.5, 18.00), Outcome(0.5, 6.00),
-            ]),
-        ],
-    ),
-    Decision(
-        name="preview_loss_small_downside",
-        category="Loss",
-        title="Small Downside Risk",
-        description=(
-            "You currently have $6.00 in hand.\n\n"
-            "Option A: Keep your $6.00. No risk.\n"
-            "Option B: A gamble -- 70% chance your total becomes $10.00 "
-            "(gain $4), but a 30% chance your total becomes $2.00 "
-            "(lose $4).\n\n"
-            "Which do you choose?"
-        ),
-        options=[
-            Option("Option A: Keep $6.00", [Outcome(1.0, 6.00)]),
-            Option("Option B: Gamble (70% $10 / 30% $2)", [
-                Outcome(0.7, 10.00), Outcome(0.3, 2.00),
-            ]),
-        ],
-    ),
-    Decision(
-        name="preview_loss_cut_or_hold",
-        category="Loss",
-        title="Cut Your Losses",
-        description=(
-            "You started with $15.00 but have already lost $5.00, "
-            "leaving you with $10.00.\n\n"
-            "Option A: Walk away with your $10.00.\n"
-            "Option B: A gamble -- 45% chance you recover to $15.00, "
-            "but a 55% chance you drop to $4.00.\n\n"
-            "Which do you choose?"
-        ),
-        options=[
-            Option("Option A: Walk away with $10.00", [Outcome(1.0, 10.00)]),
-            Option("Option B: Gamble (45% $15 / 55% $4)", [
-                Outcome(0.45, 15.00), Outcome(0.55, 4.00),
-            ]),
-        ],
-    ),
-
-    # ---- Insurance (3 preview problems) ----
-    Decision(
-        name="preview_ins_equipment",
-        category="Insurance",
-        title="Equipment Protection",
-        description=(
-            "You have equipment worth $25.00. There is a 10% chance "
-            "of damage that would cost you $20.00 to repair.\n\n"
-            "Option A: Buy a protection plan for $3.50. You are "
-            "guaranteed to keep at least $21.50 no matter what.\n"
-            "Option B: No protection. 90% chance you keep $25.00, "
-            "10% chance you end up with $5.00.\n\n"
-            "Which do you choose?"
-        ),
-        options=[
-            Option("Option A: Buy protection (keep $21.50)", [
-                Outcome(1.0, 21.50),
-            ]),
-            Option("Option B: No protection (90% $25 / 10% $5)", [
-                Outcome(0.9, 25.00), Outcome(0.1, 5.00),
-            ]),
-        ],
-    ),
-    Decision(
-        name="preview_ins_weather",
-        category="Insurance",
-        title="Weather Insurance",
-        description=(
-            "You are planning an outdoor event that will earn $16.00. "
-            "There is a 25% chance of bad weather, which would reduce "
-            "your earnings to $4.00.\n\n"
-            "Option A: Buy weather insurance for $4.00. You are "
-            "guaranteed to end with $12.00 regardless of weather.\n"
-            "Option B: No insurance. 75% chance you earn $16.00, "
-            "25% chance you earn $4.00.\n\n"
-            "Which do you choose?"
-        ),
-        options=[
-            Option("Option A: Buy insurance (keep $12.00)", [
-                Outcome(1.0, 12.00),
-            ]),
-            Option("Option B: No insurance (75% $16 / 25% $4)", [
-                Outcome(0.75, 16.00), Outcome(0.25, 4.00),
-            ]),
-        ],
-    ),
-    Decision(
-        name="preview_ins_rare_disaster",
-        category="Insurance",
-        title="Rare Disaster Coverage",
-        description=(
-            "You have $30.00. There is a 5% chance of a disaster that "
-            "would cost you $25.00.\n\n"
-            "Option A: Buy insurance for $2.00. You are guaranteed to "
-            "keep $28.00 regardless of what happens.\n"
-            "Option B: No insurance. 95% chance you keep $30.00, "
-            "5% chance you end up with $5.00.\n\n"
-            "Which do you choose?"
-        ),
-        options=[
-            Option("Option A: Buy insurance (keep $28.00)", [
-                Outcome(1.0, 28.00),
-            ]),
-            Option("Option B: No insurance (95% $30 / 5% $5)", [
-                Outcome(0.95, 30.00), Outcome(0.05, 5.00),
-            ]),
-        ],
-    ),
-
-    # ---- Ambiguity (3 preview problems) ----
-    Decision(
-        name="preview_amb_cards",
-        category="Ambiguity",
-        title="Known vs. Unknown Deck",
-        description=(
-            "Two decks of 20 cards each contain red and black cards. "
-            "You will draw one card. If it is red, you win $8.00. "
-            "If black, you win $0.\n\n"
-            "Deck A: You know it has exactly 10 red and 10 black cards.\n"
-            "Deck B: It has some mix of red and black, but you do not "
-            "know the ratio.\n\n"
-            "Which deck do you draw from?"
-        ),
-        options=[
-            Option("Deck A: Known 50/50", [
-                Outcome(0.5, 8.00), Outcome(0.5, 0.00),
-            ]),
-            Option("Deck B: Unknown ratio", [
-                Outcome(0.5, 8.00), Outcome(0.5, 0.00),
-            ]),
-        ],
-    ),
-    Decision(
-        name="preview_amb_bonus",
-        category="Ambiguity",
-        title="Bonus Wheel",
-        description=(
-            "Two spinning wheels determine a bonus payment.\n\n"
-            "Wheel A: You can see it has a 40% green zone ($12.00) "
-            "and a 60% white zone ($0). The odds are printed clearly.\n"
-            "Wheel B: It has a green zone ($12.00) and a white zone ($0), "
-            "but the zones are covered and you cannot see how large "
-            "each one is.\n\n"
-            "Which wheel do you spin?"
-        ),
-        options=[
-            Option("Wheel A: Known 40% chance of $12", [
-                Outcome(0.4, 12.00), Outcome(0.6, 0.00),
-            ]),
-            Option("Wheel B: Unknown chance of $12", [
-                Outcome(0.4, 12.00), Outcome(0.6, 0.00),
-            ]),
-        ],
-    ),
-    Decision(
-        name="preview_amb_jar",
-        category="Ambiguity",
-        title="Mystery Jar",
-        description=(
-            "Two jars contain gold and silver coins.\n\n"
-            "Jar A: Contains exactly 30 gold and 70 silver coins. "
-            "Drawing gold wins $15.00; silver wins $2.00.\n"
-            "Jar B: Contains some mix of gold and silver coins "
-            "(total 100), but the ratio is unknown. Same prizes.\n\n"
-            "Which jar do you draw from?"
-        ),
-        options=[
-            Option("Jar A: Known 30/70 gold/silver", [
-                Outcome(0.3, 15.00), Outcome(0.7, 2.00),
-            ]),
-            Option("Jar B: Unknown ratio", [
-                Outcome(0.3, 15.00), Outcome(0.7, 2.00),
-            ]),
-        ],
-    ),
-
-    # ---- Investment (3 preview problems) ----
-    Decision(
-        name="preview_inv_startup",
-        category="Investment",
-        title="Startup vs. Bonds",
-        description=(
-            "You have $8.00 to invest in one of three options.\n\n"
-            "Option A (Bonds): Guaranteed return -- you end with $9.50.\n"
-            "Option B (Index Fund): 60% chance you end with $14.00, "
-            "40% chance you end with $5.00.\n"
-            "Option C (Startup): 15% chance you end with $40.00, "
-            "85% chance you end with $3.00.\n\n"
-            "Which do you choose?"
-        ),
-        options=[
-            Option("Option A: Bonds ($9.50 guaranteed)", [
-                Outcome(1.0, 9.50),
-            ]),
-            Option("Option B: Index Fund (60/40 $14 or $5)", [
-                Outcome(0.6, 14.00), Outcome(0.4, 5.00),
-            ]),
-            Option("Option C: Startup (15/85 $40 or $3)", [
-                Outcome(0.15, 40.00), Outcome(0.85, 3.00),
-            ]),
-        ],
-    ),
-    Decision(
-        name="preview_inv_real_estate",
-        category="Investment",
-        title="Property Investment",
-        description=(
-            "You have $15.00 to invest in one of three properties.\n\n"
-            "Property A (Rental): Steady income -- you end with $17.00.\n"
-            "Property B (Flip): 50% chance you end with $24.00, "
-            "50% chance you end with $11.00.\n"
-            "Property C (Development): 25% chance you end with $40.00, "
-            "75% chance you end with $8.00.\n\n"
-            "Which property do you invest in?"
-        ),
-        options=[
-            Option("Property A: Rental ($17.00 guaranteed)", [
-                Outcome(1.0, 17.00),
-            ]),
-            Option("Property B: Flip (50/50 $24 or $11)", [
-                Outcome(0.5, 24.00), Outcome(0.5, 11.00),
-            ]),
-            Option("Property C: Development (25/75 $40 or $8)", [
-                Outcome(0.25, 40.00), Outcome(0.75, 8.00),
-            ]),
-        ],
-    ),
-    Decision(
-        name="preview_inv_portfolio",
-        category="Investment",
-        title="Portfolio Mix",
-        description=(
-            "You have $12.00 to allocate to one strategy.\n\n"
-            "Strategy A (Conservative): You end with $13.50 guaranteed.\n"
-            "Strategy B (Balanced): 55% chance you end with $20.00, "
-            "45% chance you end with $8.00.\n"
-            "Strategy C (Growth): 35% chance you end with $28.00, "
-            "65% chance you end with $6.00.\n\n"
-            "Which strategy do you choose?"
-        ),
-        options=[
-            Option("Strategy A: Conservative ($13.50 guaranteed)", [
-                Outcome(1.0, 13.50),
-            ]),
-            Option("Strategy B: Balanced (55/45 $20 or $8)", [
-                Outcome(0.55, 20.00), Outcome(0.45, 8.00),
-            ]),
-            Option("Strategy C: Growth (35/65 $28 or $6)", [
-                Outcome(0.35, 28.00), Outcome(0.65, 6.00),
-            ]),
-        ],
-    ),
-]
-
-
-# ------------------------------------------------------------------
-# Preview helpers
-# ------------------------------------------------------------------
-
-def sample_preview_problems(n: int = 5) -> list[Decision]:
-    """Sample n preview problems with round-robin category coverage.
-
-    Ensures at least one problem from each category (up to n), then
-    fills remaining slots randomly from unused problems.
-    """
-    by_category: dict[str, list[Decision]] = {}
-    for d in PREVIEW_DECISIONS:
-        by_category.setdefault(d.category, []).append(d)
-
-    selected: list[Decision] = []
-    categories = list(by_category.keys())
-    random.shuffle(categories)
-
-    # Round-robin: one from each category
-    for cat in categories:
-        if len(selected) >= n:
-            break
-        pick = random.choice(by_category[cat])
-        selected.append(pick)
-
-    # Fill remaining slots from unused problems
-    if len(selected) < n:
-        used_names = {d.name for d in selected}
-        remaining = [d for d in PREVIEW_DECISIONS if d.name not in used_names]
-        random.shuffle(remaining)
-        selected.extend(remaining[: n - len(selected)])
-
-    random.shuffle(selected)
-    return selected
-
-
-def build_preview_survey(problems: list[Decision]) -> Survey:
-    """Build an EDSL survey from a subset of preview problems."""
+def build_test_survey(problems: list[Decision]) -> Survey:
+    """Build an EDSL survey from a list of test questions."""
     questions = [d.to_question() for d in problems]
     return Survey(questions)
 
 
-def simulate_preview(
-    choices: dict[str, str],
-    problems: list[Decision],
-    n_sims: int = 500,
-) -> dict:
-    """Simulate payoffs for an arbitrary list of decisions.
+def match_option(decision: Decision, chosen_label: str | None) -> Option | None:
+    """The option an answer refers to, or None if there is no answer."""
+    if chosen_label is None:
+        return None
+    for opt in decision.options:
+        if opt.label == chosen_label:
+            return opt
+    for opt in decision.options:
+        # The agent might abbreviate the label
+        if chosen_label in opt.label or opt.label in chosen_label:
+            return opt
+    return decision.options[0]  # fallback
 
-    Same return shape as simulate_session:
-      - per_problem: [{name, title, category, chosen, ev, simulated_payoffs}, ...]
-      - total_payoffs: [sum for each of n_sims simulations]
+
+def play_once(choices: dict[str, str], problems: list[Decision]) -> list[dict]:
+    """Draw each chosen lottery once. An unanswered decision pays $0.
+
+    Returns one dict per decision:
+      {name, title, category, chosen, certain, outcome_label, probability, payoff}
+    where outcome_label and probability describe the outcome that came up.
     """
-    per_problem = []
-    total_payoffs = [0.0] * n_sims
-
+    played = []
     for decision in problems:
-        chosen_label = choices.get(decision.name)
-        if chosen_label is None:
-            per_problem.append({
-                "name": decision.name,
-                "title": decision.title,
-                "category": decision.category,
-                "chosen": "No answer",
-                "ev": 0,
-                "simulated_payoffs": [0.0] * n_sims,
-            })
-            continue
+        option = match_option(decision, choices.get(decision.name))
+        drawn = option.draw() if option else None
+        played.append({
+            "name": decision.name,
+            "title": decision.title,
+            "category": decision.category,
+            "chosen": option.label if option else "No answer",
+            "certain": option is not None and len(option.outcomes) == 1,
+            "outcome_label": drawn.label if drawn else "",
+            "probability": drawn.probability if drawn else None,
+            "payoff": drawn.payoff if drawn else 0.0,
+        })
+    return played
 
-        # Find the chosen option
-        chosen_option = None
-        for opt in decision.options:
-            if opt.label == chosen_label:
-                chosen_option = opt
-                break
 
-        if chosen_option is None:
-            for opt in decision.options:
-                if chosen_label in opt.label or opt.label in chosen_label:
-                    chosen_option = opt
-                    break
+def summarize_runs(
+    choice_runs: list[dict[str, str]],
+    problems: list[Decision],
+    n_sims: int = 1000,
+) -> dict:
+    """Summarize repeated runs of one agent on the same questions.
 
-        if chosen_option is None:
-            chosen_option = decision.options[0]
+    choice_runs holds one {question_name: chosen_label} dict per run.
 
-        payoffs = [chosen_option.simulate() for _ in range(n_sims)]
-        for i in range(n_sims):
-            total_payoffs[i] += payoffs[i]
-
+    Returns dict with:
+      - runs: number of runs
+      - per_problem: [{name, title, category, shares, ev}, ...] where shares
+        maps each option label (or "No answer") to its share of runs, and ev
+        is the mean expected value of the chosen option across runs
+      - total_payoffs: n_sims totals; each picks one run at random and draws
+        every chosen lottery once
+    """
+    matched = [
+        [match_option(d, run.get(d.name)) for d in problems] for run in choice_runs
+    ]
+    per_problem = []
+    for j, decision in enumerate(problems):
+        picks = [row[j] for row in matched]
+        shares: dict[str, float] = {}
+        for opt in picks:
+            label = opt.label if opt else "No answer"
+            shares[label] = shares.get(label, 0) + 1 / len(picks)
         per_problem.append({
             "name": decision.name,
             "title": decision.title,
             "category": decision.category,
-            "chosen": chosen_label,
-            "ev": chosen_option.expected_value,
-            "simulated_payoffs": payoffs,
+            "shares": shares,
+            "ev": sum(opt.expected_value if opt else 0.0 for opt in picks) / len(picks),
         })
 
+    total_payoffs = []
+    for _ in range(n_sims):
+        row = random.choice(matched)
+        total_payoffs.append(sum(opt.simulate() if opt else 0.0 for opt in row))
+
     return {
+        "runs": len(choice_runs),
         "per_problem": per_problem,
         "total_payoffs": total_payoffs,
     }

@@ -1,8 +1,9 @@
 """
 Agent Delegation Lab
 =====================
-Pre-commit to an AI agent, then watch it face 8 economic decisions.
-How much of your budget will you spend for control -- and for information?
+See the 8 decisions your agent will face, pay to test agents on practice
+question banks, then commit to one agent. It answers each decision once and
+each lottery is drawn once.
 
 Launch:  streamlit run app.py
 """
@@ -12,6 +13,7 @@ from __future__ import annotations
 import os
 import random
 
+import numpy as np
 import streamlit as st
 
 # Streamlit Cloud stores the key in st.secrets; EDSL reads it from the environment.
@@ -24,18 +26,10 @@ except Exception:
     pass
 
 from agents import PRESETS, create_agent
-from decisions import (
-    DECISIONS,
-    CATEGORY_DESCRIPTIONS,
-    simulate_session,
-    sample_preview_problems,
-)
-from engine import run_session, run_preview
-from plots import (
-    plot_total_payoff_distribution,
-    plot_problem_breakdown,
-    plot_comparison,
-)
+from banks import BANKS, BANKS_BY_KEY
+from decisions import DECISIONS
+from engine import check_instructions, run_session, run_tests
+from plots import plot_payoff_hists
 from logger import log_session
 
 # ---- page config ----
@@ -47,34 +41,118 @@ st.set_page_config(
 
 # ---- constants ----
 BASE_BUDGET = 10.00
-PREVIEW_COST_PRESET = 0.50
-PREVIEW_COST_CUSTOM = 1.00
+TEST_PRICES = {"category": 0.01, "near": 0.03}  # per agent, question, and run; preset agent
+OWN_AGENT_TEST_MULTIPLIER = 2
+RUN_CHOICES = [1, 10, 100]
+OWN_AGENT = "My agent"
 TIER_COSTS = {
     "Default": 0.00,
     "Choose": 1.00,
-    "Edit": 3.00,
     "Custom": 5.00,
 }
 TIER_DESCRIPTIONS = {
-    "Default": "A preset agent is assigned to you at random. No extra cost.",
+    "Default": "You get a preset agent picked at random. It costs nothing.",
     "Choose": "Pick which preset agent represents you.",
-    "Edit": "Pick a preset and modify its instructions.",
     "Custom": "Write your agent's instructions from scratch.",
 }
+GENERAL_APPROACH_RULE = (
+    "Describe a general approach. Instructions that refer to any of the 8 "
+    "decisions are rejected."
+)
 
 # ---- session state ----
-if "budget_remaining" not in st.session_state:
-    st.session_state.budget_remaining = BASE_BUDGET
-if "preview_history" not in st.session_state:
-    st.session_state.preview_history = []
-if "committed" not in st.session_state:
-    st.session_state.committed = False
-if "session_results" not in st.session_state:
-    st.session_state.session_results = None
-if "history" not in st.session_state:
-    st.session_state.history = []
-if "preview_run_counter" not in st.session_state:
-    st.session_state.preview_run_counter = 0
+DEFAULTS = {
+    "budget_remaining": BASE_BUDGET,
+    "test_history": [],
+    "own_agent_versions": {},  # instruction text -> "My agent vN"
+    "last_own_instruction": "",
+    "instruction_checks": {},  # instruction text -> (allowed, reason)
+    "committed": False,
+    "session_results": None,
+}
+for key, value in DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+# ---- helpers ----
+def esc(text: str) -> str:
+    """Escape $ so Streamlit does not render it as math."""
+    return text.replace("$", "\\$")
+
+
+def md(text: str) -> str:
+    """esc() plus hard line breaks, for decision descriptions."""
+    return esc(text).replace("\n", "  \n")
+
+
+def plural(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
+def question_label(decision) -> str:
+    """Number within its bank plus title, e.g. '7. Small Edge'."""
+    return f"{int(decision.name.rsplit('_', 1)[1])}. {decision.title}"
+
+
+def option_name(label: str) -> str:
+    """'Option A: $5.00 for certain' -> 'Option A'."""
+    return label.split(":")[0]
+
+
+def test_price(bank_kind: str, own_agent: bool) -> float:
+    price = TEST_PRICES[bank_kind]
+    return price * OWN_AGENT_TEST_MULTIPLIER if own_agent else price
+
+
+def safest_label(decision) -> str:
+    """Label of the option whose payoff varies least."""
+    def spread(opt):
+        ev = opt.expected_value
+        return sum(o.probability * (o.payoff - ev) ** 2 for o in opt.outcomes)
+    return min(decision.options, key=spread).label
+
+
+def format_shares(decision, shares: dict[str, float], runs: int) -> str:
+    """One run: the option picked. More runs: each option's share, in option order."""
+    order = [o.label for o in decision.options] + ["No answer"]
+    picked = [label for label in order if shares.get(label, 0) > 0]
+    if runs == 1:
+        return option_name(picked[0])
+    return ", ".join(f"{option_name(label)} {shares[label]:.0%}" for label in picked)
+
+
+def check_own_instructions(text: str) -> tuple[bool, str]:
+    """Run the instruction check once per distinct text; log rejections."""
+    checks = st.session_state.instruction_checks
+    if text not in checks:
+        checks[text] = check_instructions(text)
+        if not checks[text][0]:
+            try:
+                log_session(
+                    game_key="delegation_lab_instruction_check",
+                    agent_configs=[{"instruction": text}],
+                    settings={},
+                    results={"allowed": False, "reason": checks[text][1]},
+                )
+            except Exception:
+                pass
+    return checks[text]
+
+
+def what_came_up(outcome: dict) -> str:
+    if outcome["chosen"] == "No answer":
+        return "No answer, so no payoff"
+    if outcome["certain"]:
+        return f"${outcome['payoff']:.2f} for certain"
+    label, p = outcome["outcome_label"], outcome["probability"]
+    if label and outcome["category"] == "Ambiguity":
+        return f"A {label.lower()}"  # no chance shown when the odds are unknown
+    chance = "one in three" if abs(p - 1 / 3) < 1e-9 else f"{round(p * 100)}% chance"
+    if label:
+        return f"{label} ({chance})"
+    return f"The {chance}"
+
 
 # =====================================================================
 # HEADER
@@ -82,35 +160,26 @@ if "preview_run_counter" not in st.session_state:
 st.title("Agent Delegation Lab")
 
 with st.expander("About this experiment", expanded=True):
-    st.markdown(
-        """
-**What is this?** You delegate economic decisions to an AI agent.
-The agent faces 8 decision problems -- lotteries, insurance choices,
-investment allocations, and loss-framed gambles -- and you keep
-whatever it earns.
-
-**The twist: you pay for control.** You start with a $10 budget.
-You can spend some of it to choose, customize, or even write your
-own agent's instructions. You can also spend budget to *preview*
-how an agent behaves on practice problems before you commit.
-More control costs more, leaving less guaranteed money in your pocket.
-
-**What we're studying:** How much do people pay for control over
-their AI delegate? Does previewing agents change which ones people
-pick? Do custom-written agents actually outperform the presets?
-
-**How it works:**
-1. **Scout** (optional) -- Pay to preview agents on practice problems
-   (different from the real 8). See how they handle risk, losses, and ambiguity.
-2. **Commit** -- Choose a control tier and configure your agent.
-   The tier cost comes out of your remaining budget.
-3. **Run** -- Your agent faces the real 8 decisions. You see
-   the payoff distribution from 1,000 Monte Carlo simulations.
-
-Each session makes one LLM call (8 questions, ~$0.005) and runs
-instantly. All decisions use real behavioral economics paradigms.
-"""
-    )
+    st.markdown(esc(
+        "You choose an AI agent to make 8 money decisions for you. "
+        "You keep what the agent earns, plus any budget you do not spend.\n\n"
+        f"You start with a budget of ${BASE_BUDGET:.0f}. "
+        "You can spend it in two ways.\n\n"
+        "- You can test agents on practice questions before you choose.\n"
+        "- You can pay to pick which preset agent you get, or to write your "
+        "own agent's instructions.\n\n"
+        "How it works:\n\n"
+        "1. Read the 8 decisions your agent will face. You can read them, "
+        "but you cannot test any agent on them.\n"
+        "2. Test agents on practice questions. This step is optional, and "
+        "each test costs money. An agent can answer the same question "
+        "differently each time, so tests show how often it picks each option.\n"
+        "3. Choose a control tier and set up your agent.\n"
+        "4. Your agent makes each of the 8 decisions once, and each lottery "
+        "is drawn once. You see what it chose, what came up, and what you earned.\n\n"
+        "We study how much people pay to test and control an AI agent, and "
+        "whether testing changes which agent they pick."
+    ))
 
 # Budget display
 budget = st.session_state.budget_remaining
@@ -121,257 +190,323 @@ col_b2.metric("Spent So Far", f"${spent:.2f}")
 col_b3.metric("Budget Remaining", f"${budget:.2f}")
 
 # =====================================================================
-# STEP 1: Show what the agent will face
+# STEP 1: The 8 target decisions, visible but not testable
 # =====================================================================
-with st.expander("What will my agent face? (click to see categories)", expanded=False):
-    st.markdown("Your agent will face **8 decision problems** drawn from these categories:")
-    for cat, desc in CATEGORY_DESCRIPTIONS.items():
-        st.markdown(f"- **{cat}:** {desc}")
-    st.markdown(
-        "*You can see the categories, but not the specific problems. "
-        "Your agent will see each problem for the first time when it decides.*"
-    )
+st.subheader("Step 1. The decisions your agent will face")
+st.markdown(
+    "Your agent will face these 8 decisions at the end. "
+    "You can read them now. You cannot test any agent on them."
+)
+with st.expander("Read the 8 decisions", expanded=True):
+    target_cols = st.columns(2)
+    for i, decision in enumerate(DECISIONS):
+        with target_cols[i % 2], st.container(border=True):
+            st.markdown(f"**{i + 1}. {decision.title}** ({decision.category})")
+            st.markdown(md(decision.description))
 
 st.divider()
 
 # =====================================================================
-# STEP 2: Browse agents & optional previews (before commitment)
+# STEP 2: Test lab (before commitment)
 # =====================================================================
 if not st.session_state.committed:
-    st.subheader("Step 1: Scout your agents (optional)")
-    st.markdown(
-        "Preview any agent on a set of **practice problems** -- different from "
-        "the real 8. "
-        f"Previewing a preset costs **${PREVIEW_COST_PRESET:.2f}**. "
-        f"Previewing a custom agent costs **${PREVIEW_COST_CUSTOM:.2f}**."
-    )
+    st.subheader("Step 2. Test agents on practice questions (optional)")
+    cat_price, near_price = TEST_PRICES["category"], TEST_PRICES["near"]
+    st.markdown(esc(
+        "You can test any agent on practice questions before you choose. "
+        "The practice questions are different from the 8 decisions above.\n\n"
+        "Each run is a new answer from the agent. The same agent can answer "
+        "the same question differently, so more runs show how consistent it "
+        "is. At the end, your agent answers each of the 8 decisions only once.\n\n"
+        "You pay for each agent, on each question, for each run. "
+        "Here are the prices for one run:\n\n"
+        "- Category banks hold questions of the same kinds as the 8 decisions, "
+        f"with different amounts and odds. One run costs ${cat_price:.2f} "
+        f"for a preset agent and ${test_price('category', True):.2f} for your own agent.\n"
+        "- Close variant banks hold small changes to one of the 8 decisions. "
+        f"One run costs ${near_price:.2f} for a preset agent and "
+        f"${test_price('near', True):.2f} for your own agent."
+    ))
 
-    # ---- Preset previews ----
-    st.markdown("#### Preset Agents")
-    preset_names = list(PRESETS.keys())
+    col_agents, col_bank = st.columns(2)
 
-    for preset_name in preset_names:
-        preset = PRESETS[preset_name]
-        with st.container(border=True):
-            col_info, col_action = st.columns([3, 1])
-            with col_info:
-                st.markdown(f"**{preset_name}**")
-                st.markdown(f"*{preset['description']}*")
-                with st.expander("See full instructions"):
-                    st.code(preset["instruction"], language=None)
-            with col_action:
-                can_afford = st.session_state.budget_remaining >= PREVIEW_COST_PRESET
-                btn_key = (
-                    f"preview_preset_{preset_name}_"
-                    f"{st.session_state.preview_run_counter}"
-                )
-                if st.button(
-                    f"Preview (${PREVIEW_COST_PRESET:.2f})",
-                    key=btn_key,
-                    use_container_width=True,
-                    disabled=not can_afford,
-                ):
-                    st.session_state.budget_remaining -= PREVIEW_COST_PRESET
-                    st.session_state.preview_run_counter += 1
-                    agent = create_agent(
-                        "Preview_Agent", preset_name=preset_name
-                    )
-                    problems = sample_preview_problems(n=5)
-                    with st.spinner(
-                        f"Previewing {preset_name} on 5 practice problems..."
-                    ):
-                        try:
-                            result = run_preview(agent, problems)
-                            st.session_state.preview_history.append({
-                                "agent_label": preset_name,
-                                "cost": PREVIEW_COST_PRESET,
-                                "result": result,
-                                "problems": problems,
-                                "is_custom": False,
-                            })
-                            try:
-                                log_session(
-                                    game_key="delegation_lab_preview",
-                                    agent_configs=[{"preset": preset_name}],
-                                    settings={
-                                        "preview_cost": PREVIEW_COST_PRESET,
-                                        "budget_after": (
-                                            st.session_state.budget_remaining
-                                        ),
-                                        "n_problems": len(problems),
-                                        "problem_names": [
-                                            p.name for p in problems
-                                        ],
-                                    },
-                                    results={"choices": result["choices"]},
-                                )
-                            except Exception:
-                                pass
-                        except Exception as exc:
-                            st.error(f"Preview failed: {exc}")
-                            st.session_state.budget_remaining += (
-                                PREVIEW_COST_PRESET
-                            )
-                        else:
-                            st.rerun()
-                if not can_afford:
-                    st.caption("Not enough budget")
-
-    # ---- Custom preview ----
-    st.markdown("#### Custom Agent Preview")
-    st.markdown(
-        f"Write your own instructions and preview how the agent behaves. "
-        f"Costs **${PREVIEW_COST_CUSTOM:.2f}**."
-    )
-    custom_preview_instruction = st.text_area(
-        "Custom agent instructions (for preview):",
-        height=150,
-        key="custom_preview_text",
-        placeholder=(
-            "Describe how your agent should approach decisions. "
-            "What should it prioritize? How should it handle risk?"
-        ),
-    )
-    can_afford_custom = (
-        st.session_state.budget_remaining >= PREVIEW_COST_CUSTOM
-    )
-    if st.button(
-        f"Preview Custom Agent (${PREVIEW_COST_CUSTOM:.2f})",
-        disabled=(
-            not can_afford_custom or not custom_preview_instruction.strip()
-        ),
-        use_container_width=True,
-    ):
-        st.session_state.budget_remaining -= PREVIEW_COST_CUSTOM
-        st.session_state.preview_run_counter += 1
-        agent = create_agent(
-            "Preview_Custom",
-            custom_instruction=custom_preview_instruction.strip(),
+    with col_agents:
+        chosen_presets = st.multiselect(
+            "Preset agents to test", list(PRESETS), key="test_presets"
         )
-        problems = sample_preview_problems(n=5)
-        with st.spinner("Previewing custom agent on 5 practice problems..."):
+        with st.expander("Read the preset agents' instructions"):
+            for name, preset in PRESETS.items():
+                st.markdown(f"**{name}**. {esc(preset['description'])}")
+                st.code(preset["instruction"], language=None)
+        own_text = st.text_area(
+            "Your own agent's instructions (optional)",
+            height=150,
+            key="own_agent_text",
+            placeholder=(
+                "Describe how your agent should make decisions. For example, "
+                "say what it should care about and how much risk it should take."
+            ),
+        ).strip()
+        st.caption(
+            f"{GENERAL_APPROACH_RULE} You are not charged for a rejected test. "
+            f"If you test different instructions, we label them {OWN_AGENT} v1, "
+            f"{OWN_AGENT} v2, and so on."
+        )
+
+    with col_bank:
+        bank_key = st.selectbox(
+            "Question bank",
+            [b.key for b in BANKS],
+            format_func=lambda k: (
+                f"{BANKS_BY_KEY[k].name} ({len(BANKS_BY_KEY[k].decisions)} questions, "
+                f"${TEST_PRICES[BANKS_BY_KEY[k].kind]:.2f} per run for a preset agent)"
+            ),
+            key="test_bank",
+        )
+        bank = BANKS_BY_KEY[bank_key]
+        with st.expander(f"Browse the {len(bank.decisions)} questions in this bank for free"):
+            for decision in bank.decisions:
+                st.markdown(f"**{question_label(decision)}**")
+                st.markdown(md(decision.description))
+        use_all = st.checkbox("Use all questions in this bank", key="test_use_all")
+        picked = st.multiselect(
+            "Questions to test",
+            [d.name for d in bank.decisions],
+            format_func=lambda n: question_label(
+                next(d for d in bank.decisions if d.name == n)
+            ),
+            key=f"test_questions_{bank.key}",
+            disabled=use_all,
+        )
+        problems = (
+            bank.decisions if use_all
+            else [d for d in bank.decisions if d.name in picked]
+        )
+        runs = st.radio(
+            "Runs per question", RUN_CHOICES, index=1, horizontal=True, key="test_runs"
+        )
+        st.caption("A test with 100 runs can take a few minutes.")
+
+    n_agents = len(chosen_presets) + (1 if own_text else 0)
+    cost = round(
+        len(problems)
+        * runs
+        * (
+            len(chosen_presets) * test_price(bank.kind, False)
+            + (test_price(bank.kind, True) if own_text else 0)
+        ),
+        2,
+    )
+    can_afford_test = cost <= st.session_state.budget_remaining + 1e-9
+
+    if n_agents == 0:
+        st.caption("Pick at least one agent to test.")
+    elif not problems:
+        st.caption("Pick at least one question.")
+    else:
+        st.markdown(esc(
+            f"This test runs {plural(n_agents, 'agent')} {plural(runs, 'time')} "
+            f"on each of {plural(len(problems), 'question')} and costs ${cost:.2f}."
+        ))
+        if not can_afford_test:
+            st.caption("You do not have enough budget for this test.")
+
+    if st.button(
+        esc(f"Run test (${cost:.2f})"),
+        disabled=not (n_agents and problems and can_afford_test),
+        width="stretch",
+    ):
+        blocked = False
+        if own_text:
             try:
-                result = run_preview(agent, problems)
-                st.session_state.preview_history.append({
-                    "agent_label": "Custom Agent",
-                    "cost": PREVIEW_COST_CUSTOM,
-                    "result": result,
-                    "problems": problems,
-                    "is_custom": True,
-                })
-                try:
-                    log_session(
-                        game_key="delegation_lab_preview",
-                        agent_configs=[{
-                            "preset": "custom",
-                            "instruction": custom_preview_instruction[:200],
-                        }],
-                        settings={
-                            "preview_cost": PREVIEW_COST_CUSTOM,
-                            "budget_after": (
-                                st.session_state.budget_remaining
-                            ),
-                            "n_problems": len(problems),
-                            "problem_names": [p.name for p in problems],
-                        },
-                        results={"choices": result["choices"]},
-                    )
-                except Exception:
-                    pass
+                with st.spinner("Checking your agent's instructions..."):
+                    allowed, reason = check_own_instructions(own_text)
             except Exception as exc:
-                st.error(f"Preview failed: {exc}")
-                st.session_state.budget_remaining += PREVIEW_COST_CUSTOM
+                st.error(
+                    "We could not check your agent's instructions, and you were "
+                    f"not charged. {exc}"
+                )
+                blocked = True
             else:
-                st.rerun()
+                if not allowed:
+                    st.error(esc(
+                        "Your agent's instructions refer to one of the 8 decisions, "
+                        f"so we did not run this test. You were not charged. {reason}"
+                    ))
+                    blocked = True
 
-    # ---- Show preview results ----
-    if st.session_state.preview_history:
-        st.divider()
-        st.subheader("Preview Results")
-        for idx, preview in enumerate(
-            reversed(st.session_state.preview_history)
-        ):
-            preview_num = len(st.session_state.preview_history) - idx
-            result = preview["result"]
-            sim = result["simulation"]
-            per_problem = sim["per_problem"]
-
-            with st.container(border=True):
-                st.markdown(
-                    f"**Preview #{preview_num}: {preview['agent_label']}** "
-                    f"(cost: ${preview['cost']:.2f})"
+        if not blocked:
+            versions = st.session_state.own_agent_versions
+            agent_specs = [
+                {"label": name, "preset": name, "instruction": PRESETS[name]["instruction"]}
+                for name in chosen_presets
+            ]
+            if own_text:
+                own_label = versions.get(own_text, f"{OWN_AGENT} v{len(versions) + 1}")
+                agent_specs.append(
+                    {"label": own_label, "preset": None, "instruction": own_text}
                 )
+            agents = [
+                create_agent(s["label"], preset_name=s["preset"])
+                if s["preset"]
+                else create_agent(s["label"], custom_instruction=s["instruction"])
+                for s in agent_specs
+            ]
 
-                # Disposition summary
-                n_safe = 0
-                n_total = len(per_problem)
-                for pp in per_problem:
-                    chosen = pp["chosen"]
-                    decision = next(
-                        (
-                            d
-                            for d in preview["problems"]
-                            if d.name == pp["name"]
-                        ),
-                        None,
+            st.session_state.budget_remaining = round(
+                st.session_state.budget_remaining - cost, 2
+            )
+            with st.spinner("Your agents are answering the practice questions..."):
+                try:
+                    results = run_tests(agents, problems, runs=runs)
+                except Exception as exc:
+                    st.session_state.budget_remaining = round(
+                        st.session_state.budget_remaining + cost, 2
                     )
-                    if decision and chosen == decision.options[0].label:
-                        n_safe += 1
-
-                st.markdown(
-                    f"Chose the safer/default option in "
-                    f"**{n_safe}/{n_total}** problems"
-                )
-
-                # Compact table of choices
-                for pp in per_problem:
-                    col_t, col_c = st.columns([2, 3])
-                    with col_t:
-                        st.caption(f"{pp['category']}: {pp['title']}")
-                    with col_c:
-                        chosen_short = pp["chosen"]
-                        if len(chosen_short) > 40:
-                            chosen_short = chosen_short[:37] + "..."
-                        st.caption(
-                            f"-> {chosen_short}  (EV: ${pp['ev']:.2f})"
+                    st.error(f"The test failed, and you were not charged. {exc}")
+                else:
+                    if own_text:
+                        versions[own_text] = own_label
+                        st.session_state.last_own_instruction = own_text
+                    st.session_state.test_history.append({
+                        "bank_key": bank.key,
+                        "bank_name": bank.name,
+                        "bank_kind": bank.kind,
+                        "problems": problems,
+                        "runs": runs,
+                        "agents": agent_specs,
+                        "results": results,
+                        "cost": cost,
+                    })
+                    try:
+                        log_session(
+                            game_key="delegation_lab_test",
+                            agent_configs=agent_specs,
+                            settings={
+                                "bank": bank.key,
+                                "bank_kind": bank.kind,
+                                "questions": [d.name for d in problems],
+                                "runs": runs,
+                                "cost": cost,
+                                "budget_after": st.session_state.budget_remaining,
+                            },
+                            results={
+                                label: r["choice_runs"] for label, r in results.items()
+                            },
                         )
+                    except Exception:
+                        pass
+                    st.rerun()
 
-                import numpy as np
+    # ---- Test results ----
+    if st.session_state.test_history:
+        st.divider()
+        st.subheader("Your test results")
 
-                mean_ev = np.mean([pp["ev"] for pp in per_problem])
+        for n, record in reversed(
+            list(enumerate(st.session_state.test_history, 1))
+        ):
+            with st.container(border=True):
+                st.markdown(f"##### Test {n}")
+                st.caption(esc(
+                    f"{record['bank_name']}. {plural(len(record['problems']), 'question')}, "
+                    f"{plural(record['runs'], 'run')} per question. Cost ${record['cost']:.2f}."
+                ))
+                rows = []
+                for j, decision in enumerate(record["problems"]):
+                    row = {"Question": question_label(decision)}
+                    for label, r in record["results"].items():
+                        row[label] = format_shares(
+                            decision, r["per_problem"][j]["shares"], record["runs"]
+                        )
+                    rows.append(row)
+                mean_row = {"Question": "Average expected value per question"}
+                for label, r in record["results"].items():
+                    mean_row[label] = f"${np.mean([pp['ev'] for pp in r['per_problem']]):.2f}"
+                st.dataframe(rows + [mean_row], hide_index=True, width="stretch")
+
                 st.caption(
-                    f"Average EV across preview problems: ${mean_ev:.2f}"
+                    "Total payout on these questions for each agent, from 1,000 "
+                    "simulated rounds. Each round takes one of the agent's runs at "
+                    "random and draws each lottery once."
                 )
+                st.altair_chart(plot_payoff_hists(
+                    {label: r["total_payoffs"] for label, r in record["results"].items()},
+                    theme=st.context.theme.type,
+                ))
+
+        # ---- Summary across all tests ----
+        st.markdown("#### Summary of all your tests")
+        st.caption(
+            "Each row sums up every test you ran with that agent. Different tests "
+            "can use different questions, so compare agents within one test when "
+            "you can. The safest option is the one whose payoff varies least. "
+            "\"Same answer every run\" counts only questions you ran more than once."
+        )
+        summary: dict[str, dict] = {}
+        for record in st.session_state.test_history:
+            for label, r in record["results"].items():
+                s = summary.setdefault(
+                    label,
+                    {"questions": 0, "answers": 0, "ev": 0.0, "safest": 0.0, "repeated": 0, "same": 0},
+                )
+                for pp, decision in zip(r["per_problem"], record["problems"]):
+                    s["questions"] += 1
+                    s["answers"] += record["runs"]
+                    s["ev"] += pp["ev"]
+                    s["safest"] += pp["shares"].get(safest_label(decision), 0) * record["runs"]
+                    if record["runs"] > 1:
+                        s["repeated"] += 1
+                        s["same"] += len(pp["shares"]) == 1
+        st.dataframe(
+            [
+                {
+                    "Agent": label,
+                    "Questions tested": s["questions"],
+                    "Answers": s["answers"],
+                    "Average expected value per question": f"${s['ev'] / s['questions']:.2f}",
+                    "Chose the safest option": f"{s['safest'] / s['answers']:.0%}",
+                    "Same answer every run": (
+                        f"{s['same'] / s['repeated']:.0%}" if s["repeated"] else "No repeats"
+                    ),
+                }
+                for label, s in summary.items()
+            ],
+            hide_index=True,
+            width="stretch",
+        )
 
     # ---- Commit to tier ----
     st.divider()
-    st.subheader("Step 2: Commit to your agent")
+    st.subheader("Step 3. Choose a control tier")
     st.markdown(
-        "Choose a control tier. The tier cost is deducted from your "
-        "remaining budget. Your agent will then face the **real 8 decisions**."
+        "We take the tier cost from your remaining budget. "
+        "After you choose, you cannot run more tests."
     )
 
-    cols = st.columns(4)
-    for i, (tier, cost) in enumerate(TIER_COSTS.items()):
+    cols = st.columns(len(TIER_COSTS))
+    for i, (tier, tier_cost) in enumerate(TIER_COSTS.items()):
         with cols[i]:
-            affordable = st.session_state.budget_remaining >= cost
-            kept = st.session_state.budget_remaining - cost
+            affordable = st.session_state.budget_remaining >= tier_cost
+            kept = st.session_state.budget_remaining - tier_cost
             st.markdown(f"**{tier}**")
-            st.markdown(f"Tier cost: **${cost:.2f}**")
+            st.markdown(esc(f"Tier cost: ${tier_cost:.2f}"))
             if affordable:
-                st.markdown(f"You'd keep: ${kept:.2f}")
+                st.markdown(esc(f"You would keep ${kept:.2f}."))
             else:
-                st.markdown(f"~~You'd keep: ${kept:.2f}~~ Can't afford")
+                st.markdown("You cannot afford this tier.")
             st.caption(TIER_DESCRIPTIONS[tier])
             if st.button(
                 f"Commit: {tier}",
                 key=f"commit_{tier}",
-                use_container_width=True,
+                width="stretch",
                 disabled=not affordable,
             ):
                 st.session_state.committed = True
                 st.session_state.selected_tier = tier
-                st.session_state.budget_remaining -= cost
+                st.session_state.budget_remaining = round(
+                    st.session_state.budget_remaining - tier_cost, 2
+                )
                 if tier == "Default":
                     st.session_state.assigned_preset = random.choice(
                         list(PRESETS.keys())
@@ -385,123 +520,106 @@ if st.session_state.committed and st.session_state.session_results is None:
     selected_tier = st.session_state.selected_tier
     budget_kept = st.session_state.budget_remaining
 
-    st.subheader("Step 3: Configure your agent")
+    st.subheader("Step 3. Set up your agent")
 
-    # Show spending breakdown
-    preview_spent = sum(
-        p["cost"] for p in st.session_state.preview_history
-    )
+    test_spent = sum(r["cost"] for r in st.session_state.test_history)
     tier_cost = TIER_COSTS[selected_tier]
     with st.expander("Budget breakdown"):
-        st.markdown(f"- Starting budget: **${BASE_BUDGET:.2f}**")
-        if preview_spent > 0:
-            st.markdown(
-                f"- Previews ({len(st.session_state.preview_history)}): "
-                f"**-${preview_spent:.2f}**"
-            )
-        st.markdown(f"- Tier ({selected_tier}): **-${tier_cost:.2f}**")
-        st.markdown(f"- **Budget kept: ${budget_kept:.2f}**")
+        st.markdown(esc(f"- Starting budget: ${BASE_BUDGET:.2f}"))
+        if test_spent > 0:
+            st.markdown(esc(
+                f"- Tests ({len(st.session_state.test_history)}): -${test_spent:.2f}"
+            ))
+        st.markdown(esc(f"- Tier ({selected_tier}): -${tier_cost:.2f}"))
+        st.markdown(esc(f"- Budget kept: ${budget_kept:.2f}"))
 
     preset_names = list(PRESETS.keys())
 
     if selected_tier == "Default":
         assigned = st.session_state.assigned_preset
-        st.markdown(f"You've been assigned: **{assigned}**")
-        st.markdown(f"*\"{PRESETS[assigned]['description']}\"*")
+        st.markdown(f"You were assigned **{assigned}**.")
+        st.markdown(f"*\"{esc(PRESETS[assigned]['description'])}\"*")
         with st.expander("See full instructions"):
             st.code(PRESETS[assigned]["instruction"], language=None)
         agent_config = {"tier": "Default", "preset": assigned}
 
     elif selected_tier == "Choose":
-        chosen = st.selectbox("Pick your agent:", preset_names)
-        st.markdown(f"*\"{PRESETS[chosen]['description']}\"*")
+        chosen_preset = st.selectbox("Pick your agent:", preset_names)
+        st.markdown(f"*\"{esc(PRESETS[chosen_preset]['description'])}\"*")
         with st.expander("See full instructions"):
-            st.code(PRESETS[chosen]["instruction"], language=None)
-        agent_config = {"tier": "Choose", "preset": chosen}
-
-    elif selected_tier == "Edit":
-        base = st.selectbox("Start from:", preset_names)
-        st.markdown(f"*Original: \"{PRESETS[base]['description']}\"*")
-        edited_instruction = st.text_area(
-            "Edit the instructions:",
-            value=PRESETS[base]["instruction"],
-            height=200,
-            key="edit_instruction",
-        )
-        agent_config = {
-            "tier": "Edit",
-            "base_preset": base,
-            "instruction": edited_instruction,
-        }
+            st.code(PRESETS[chosen_preset]["instruction"], language=None)
+        agent_config = {"tier": "Choose", "preset": chosen_preset}
 
     elif selected_tier == "Custom":
         custom_instruction = st.text_area(
             "Write your agent's instructions from scratch:",
+            value=st.session_state.last_own_instruction,
             height=200,
             key="custom_instruction",
             placeholder=(
-                "Describe how your agent should approach decisions. "
-                "What should it prioritize? How should it handle risk?"
+                "Describe how your agent should make decisions. For example, "
+                "say what it should care about and how much risk it should take."
             ),
         )
+        st.caption(GENERAL_APPROACH_RULE)
+        if st.session_state.last_own_instruction:
+            st.caption(
+                "We filled in the instructions you last tested. You can change them."
+            )
         agent_config = {"tier": "Custom", "instruction": custom_instruction}
 
     st.divider()
 
     # ---- Run button ----
-    st.subheader("Step 4: Send your agent into the arena")
+    st.subheader("Step 4. Send your agent to make the 8 decisions")
+    st.markdown(
+        "Your agent answers each decision once, and each lottery is drawn once."
+    )
 
     run_clicked = st.button(
         "Run all 8 decisions",
         type="primary",
-        use_container_width=True,
+        width="stretch",
     )
 
     if run_clicked:
-        try:
-            if selected_tier == "Default":
-                agent = create_agent(
-                    "My_Agent",
-                    preset_name=st.session_state.assigned_preset,
-                )
-                display_name = st.session_state.assigned_preset
-            elif selected_tier == "Choose":
-                agent = create_agent(
-                    "My_Agent", preset_name=agent_config["preset"]
-                )
-                display_name = agent_config["preset"]
-            elif selected_tier == "Edit":
-                instruction = agent_config.get("instruction", "").strip()
-                if not instruction:
-                    st.error("Please write some instructions for your agent.")
-                    st.stop()
-                agent = create_agent(
-                    "My_Agent", custom_instruction=instruction
-                )
-                display_name = f"{agent_config['base_preset']} (edited)"
-            elif selected_tier == "Custom":
-                instruction = agent_config.get("instruction", "").strip()
-                if not instruction:
-                    st.error("Please write instructions for your agent.")
-                    st.stop()
-                agent = create_agent(
-                    "My_Agent", custom_instruction=instruction
-                )
-                display_name = "Custom Agent"
-        except Exception as exc:
-            st.error(f"Error creating agent: {exc}")
-            st.stop()
-
-        with st.spinner(
-            "Your agent is facing 8 decisions... (30-60 seconds)"
-        ):
+        if selected_tier == "Custom":
+            instruction = agent_config["instruction"].strip()
+            if not instruction:
+                st.error("Please write instructions for your agent.")
+                st.stop()
             try:
-                result = run_session(agent, n_sims=1000)
+                with st.spinner("Checking your agent's instructions..."):
+                    allowed, reason = check_own_instructions(instruction)
+            except Exception as exc:
+                st.error(f"We could not check your agent's instructions. {exc}")
+                st.stop()
+            if not allowed:
+                st.error(esc(
+                    "Your agent's instructions refer to one of the 8 decisions. "
+                    f"Change them and try again. {reason}"
+                ))
+                st.stop()
+            agent = create_agent("My_Agent", custom_instruction=instruction)
+            display_name = "Custom Agent"
+        else:
+            preset = (
+                st.session_state.assigned_preset
+                if selected_tier == "Default"
+                else agent_config["preset"]
+            )
+            agent = create_agent("My_Agent", preset_name=preset)
+            display_name = preset
+
+        with st.spinner("Your agent is making the 8 decisions..."):
+            try:
+                result = run_session(agent)
             except Exception as exc:
                 st.error(f"Error running decisions: {exc}")
                 st.exception(exc)
                 st.stop()
 
+        game_earnings = sum(o["payoff"] for o in result["outcomes"])
         st.session_state.session_results = {
             "result": result,
             "display_name": display_name,
@@ -510,10 +628,6 @@ if st.session_state.committed and st.session_state.session_results is None:
             "agent_config": agent_config,
         }
 
-        st.session_state.history.append(
-            (display_name, result["simulation"], budget_kept)
-        )
-
         try:
             log_session(
                 game_key="delegation_lab",
@@ -521,13 +635,18 @@ if st.session_state.committed and st.session_state.session_results is None:
                 settings={
                     "tier": selected_tier,
                     "budget_kept": budget_kept,
-                    "preview_count": len(st.session_state.preview_history),
-                    "preview_spent": sum(
-                        p["cost"]
-                        for p in st.session_state.preview_history
-                    ),
+                    "test_count": len(st.session_state.test_history),
+                    "test_spent": test_spent,
+                    "banks_tested": [
+                        r["bank_key"] for r in st.session_state.test_history
+                    ],
                 },
-                results={"choices": result["choices"]},
+                results={
+                    "choices": result["choices"],
+                    "outcomes": result["outcomes"],
+                    "game_earnings": game_earnings,
+                    "total_payout": budget_kept + game_earnings,
+                },
             )
         except Exception:
             pass
@@ -539,105 +658,52 @@ if st.session_state.committed and st.session_state.session_results is None:
 # =====================================================================
 if st.session_state.session_results is not None:
     sr = st.session_state.session_results
-    result = sr["result"]
-    display_name = sr["display_name"]
+    outcomes = sr["result"]["outcomes"]
     budget_kept = sr["budget_kept"]
-    simulation = result["simulation"]
+    game_earnings = sum(o["payoff"] for o in outcomes)
+    test_spent = sum(r["cost"] for r in st.session_state.test_history)
 
     st.divider()
     st.header("Results")
+    st.markdown(esc(
+        f"Your agent was {sr['display_name']}. It answered each decision once, "
+        "and each lottery was drawn once."
+    ))
 
-    # ---- Problem-by-problem choices ----
-    st.subheader("What your agent chose")
-
-    for i, prob in enumerate(simulation["per_problem"]):
-        decision = DECISIONS[i]
-        col_q, col_a = st.columns([3, 2])
-        with col_q:
-            st.markdown(
-                f"**{i+1}. {prob['title']}** ({prob['category']})"
-            )
-            st.caption(
-                decision.description[:150] + "..."
-                if len(decision.description) > 150
-                else decision.description
-            )
-        with col_a:
-            st.markdown(f"Chose: **{prob['chosen']}**")
-            st.markdown(f"Expected value: ${prob['ev']:.2f}")
-
-    # ---- Payoff distribution ----
-    st.divider()
-    st.subheader("Payoff distribution (1,000 simulations)")
-    st.caption(
-        "Your agent's choices determine which lotteries it entered. "
-        "We simulated the random outcomes 1,000 times to show the "
-        "range of possible payoffs."
+    st.dataframe(
+        [
+            {
+                "Decision": f"{i}. {o['title']}",
+                "Your agent chose": o["chosen"],
+                "What came up": what_came_up(o),
+                "Payoff": f"${o['payoff']:.2f}",
+            }
+            for i, o in enumerate(outcomes, 1)
+        ],
+        hide_index=True,
+        width="stretch",
     )
-
-    fig1 = plot_total_payoff_distribution(
-        simulation, display_name, budget_kept
-    )
-    st.pyplot(fig1)
-
-    # ---- Problem breakdown ----
-    st.subheader("Expected value by problem")
-    fig2 = plot_problem_breakdown(simulation, display_name)
-    st.pyplot(fig2)
-
-    # ---- Comparison (if multiple runs) ----
-    if len(st.session_state.history) > 1:
-        st.divider()
-        st.subheader("Compare agents")
-        names = [h[0] for h in st.session_state.history]
-        sims = [h[1] for h in st.session_state.history]
-        bks = [h[2] for h in st.session_state.history]
-        fig3 = plot_comparison(sims, names, bks)
-        st.pyplot(fig3)
-
-    # ---- Scorecard ----
-    st.divider()
-    import numpy as np
-
-    total_payoffs = simulation["total_payoffs"]
-    mean_earnings = np.mean(total_payoffs)
-    preview_spent = sum(
-        p["cost"] for p in st.session_state.preview_history
-    )
-    tier_cost = TIER_COSTS[sr["tier"]]
 
     st.subheader("Scorecard")
     sc1, sc2, sc3, sc4, sc5 = st.columns(5)
     sc1.metric("Starting Budget", f"${BASE_BUDGET:.2f}")
-    sc2.metric("Previews Spent", f"${preview_spent:.2f}")
-    sc3.metric("Tier Cost", f"${tier_cost:.2f}")
+    sc2.metric("Tests Spent", f"${test_spent:.2f}")
+    sc3.metric("Tier Cost", f"${TIER_COSTS[sr['tier']]:.2f}")
     sc4.metric("Budget Kept", f"${budget_kept:.2f}")
-    sc5.metric("Mean Game Earnings", f"${mean_earnings:.2f}")
+    sc5.metric("Game Earnings", f"${game_earnings:.2f}")
 
-    st.markdown(
-        f"### Expected Total Payout: **${budget_kept + mean_earnings:.2f}**"
-    )
+    st.markdown(esc(f"### Total Payout: ${budget_kept + game_earnings:.2f}"))
 
     # ---- Start over ----
     st.divider()
-    if st.button("Start Over (new session)", use_container_width=True):
-        for key in [
-            "budget_remaining",
-            "preview_history",
-            "committed",
-            "session_results",
-            "selected_tier",
-            "assigned_preset",
-            "preview_run_counter",
-            "history",
-        ]:
+    if st.button("Start Over (new session)", width="stretch"):
+        for key in list(DEFAULTS) + ["selected_tier", "assigned_preset"]:
             if key in st.session_state:
                 del st.session_state[key]
         st.rerun()
 
 elif not st.session_state.committed:
     st.markdown("---")
-    st.markdown(
-        "*Browse the agents above, optionally preview them, then commit "
-        "to a tier and run the real 8 decisions.*"
+    st.caption(
+        "Read the 8 decisions, test agents if you want, then choose a control tier."
     )
