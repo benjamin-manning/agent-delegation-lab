@@ -108,6 +108,87 @@ def run_session(agent, model=None) -> dict:
     }
 
 
+def run_session_with_swaps(
+    user_agent,
+    replacement_agent,
+    swaps: list[bool],
+    model=None,
+) -> dict:
+    """Run the 8 decisions, swapping in a replacement agent on some of them.
+
+    ``swaps`` is a list of 8 booleans: True means that decision is answered
+    by ``replacement_agent`` instead of ``user_agent``.
+
+    Runs two EDSL surveys (one per agent, covering its subset of decisions)
+    to minimise API calls. Returns the same shape as ``run_session`` plus
+    a ``swapped`` list showing which decisions were swapped and a
+    ``replacement_choices`` dict with the replacement agent's answers on the
+    swapped decisions.
+
+    Returns:
+        {
+            "agent_name": str,
+            "choices": merged {question_name: chosen_label},
+            "outcomes": [one dict per decision, with extra "swapped" key],
+            "swapped": [bool] * 8,
+            "replacement_agent_name": str,
+            "replacement_choices": {question_name: chosen_label} (swapped only),
+        }
+    """
+    _require_remote_inference()
+    model = model or get_model()
+
+    user_decisions = [d for d, s in zip(DECISIONS, swaps) if not s]
+    swap_decisions = [d for d, s in zip(DECISIONS, swaps) if s]
+
+    user_choices: dict[str, str] = {}
+    swap_choices: dict[str, str] = {}
+
+    # Run user agent on non-swapped decisions
+    if user_decisions:
+        survey_u = build_test_survey(user_decisions)
+        desc_u = f"Decision Lab - {user_agent.name} ({len(user_decisions)} decisions)"
+        results_u = survey_u.by(user_agent).by(model).run(
+            n=1, fresh=True,
+            remote_inference_description=desc_u,
+            results_description=desc_u,
+        )
+        user_choices = _extract_choices(
+            results_u[0] if len(results_u) else None, user_decisions,
+        )
+
+    # Run replacement agent on swapped decisions
+    if swap_decisions:
+        survey_s = build_test_survey(swap_decisions)
+        desc_s = f"Decision Lab - {replacement_agent.name} ({len(swap_decisions)} decisions)"
+        results_s = survey_s.by(replacement_agent).by(model).run(
+            n=1, fresh=True,
+            remote_inference_description=desc_s,
+            results_description=desc_s,
+        )
+        swap_choices = _extract_choices(
+            results_s[0] if len(results_s) else None, swap_decisions,
+        )
+
+    # Merge choices
+    merged = {**user_choices, **swap_choices}
+    _require_answers(merged)
+
+    # Build outcomes with swap annotation
+    outcomes = play_once(merged, DECISIONS)
+    for outcome, was_swapped in zip(outcomes, swaps):
+        outcome["swapped"] = was_swapped
+
+    return {
+        "agent_name": user_agent.name,
+        "choices": merged,
+        "outcomes": outcomes,
+        "swapped": swaps,
+        "replacement_agent_name": replacement_agent.name,
+        "replacement_choices": swap_choices,
+    }
+
+
 def run_tests(
     agents: list,
     problems: list[Decision],

@@ -5,6 +5,11 @@ See the 8 decisions your agent will face, pay to test agents on practice
 question banks, then commit to one agent. It answers each decision once and
 each lottery is drawn once.
 
+Between-subjects alignment conditions: with some probability, the
+participant's agent is replaced on each decision by a different agent.
+Conditions vary the swap probability (known vs ambiguous), the replacement
+type (opposite vs slight vs unknown), and what the participant is told.
+
 Launch:  streamlit run app.py
 """
 
@@ -25,10 +30,11 @@ try:
 except Exception:
     pass
 
-from agents import PRESETS, create_agent
+from agents import PLATFORM_AGENT, PRESETS, create_agent, create_platform_agent
 from banks import BANKS, BANKS_BY_KEY
+from conditions import CONDITIONS, CONDITION_KEYS, Condition, assign_condition
 from decisions import DECISIONS
-from engine import check_instructions, run_session, run_tests
+from engine import check_instructions, run_session, run_session_with_swaps, run_tests
 from plots import plot_payoff_hists
 from logger import log_session
 
@@ -41,18 +47,20 @@ st.set_page_config(
 
 # ---- constants ----
 BASE_BUDGET = 10.00
-TEST_PRICES = {"category": 0.01, "near": 0.03}  # per agent, question, and run; preset agent
+TEST_PRICES = {"category": 0.01, "near": 0.03}
 OWN_AGENT_TEST_MULTIPLIER = 2
 RUN_CHOICES = [1, 10, 100]
 OWN_AGENT = "My agent"
+PLATFORM_AGENT_LABEL = "Platform Agent"
+
 TIER_COSTS = {
     "Default": 0.00,
     "Choose": 1.00,
     "Custom": 5.00,
 }
 TIER_DESCRIPTIONS = {
-    "Default": "You get a preset agent picked at random. It costs nothing.",
-    "Choose": "Pick which preset agent represents you.",
+    "Default": "You get a preset agent picked at random. Its instructions are visible.",
+    "Choose": "Pick which preset agent represents you. Its instructions are visible.",
     "Custom": "Write your agent's instructions from scratch.",
 }
 GENERAL_APPROACH_RULE = (
@@ -64,25 +72,33 @@ GENERAL_APPROACH_RULE = (
 DEFAULTS = {
     "budget_remaining": BASE_BUDGET,
     "test_history": [],
-    "own_agent_versions": {},  # instruction text -> "My agent vN"
+    "own_agent_versions": {},
     "last_own_instruction": "",
-    "instruction_checks": {},  # instruction text -> (allowed, reason)
+    "instruction_checks": {},
     "committed": False,
     "session_results": None,
+    "platform_agent_tested": False,
+    "condition": None,          # Condition object, assigned on first load
+    "swap_decisions": None,     # list[bool], resolved before execution
 }
 for key, value in DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
+# ---- assign condition on first visit ----
+# Can be overridden by ?condition=key in the URL
+if st.session_state.condition is None:
+    params = st.query_params
+    cond_key = params.get("condition", None)
+    st.session_state.condition = assign_condition(cond_key)
+
 
 # ---- helpers ----
 def esc(text: str) -> str:
-    """Escape $ so Streamlit does not render it as math."""
     return text.replace("$", "\\$")
 
 
 def md(text: str) -> str:
-    """esc() plus hard line breaks, for decision descriptions."""
     return esc(text).replace("\n", "  \n")
 
 
@@ -91,12 +107,10 @@ def plural(n: int, word: str) -> str:
 
 
 def question_label(decision) -> str:
-    """Number within its bank plus title, e.g. '7. Small Edge'."""
     return f"{int(decision.name.rsplit('_', 1)[1])}. {decision.title}"
 
 
 def option_name(label: str) -> str:
-    """'Option A: $5.00 for certain' -> 'Option A'."""
     return label.split(":")[0]
 
 
@@ -106,7 +120,6 @@ def test_price(bank_kind: str, own_agent: bool) -> float:
 
 
 def safest_label(decision) -> str:
-    """Label of the option whose payoff varies least."""
     def spread(opt):
         ev = opt.expected_value
         return sum(o.probability * (o.payoff - ev) ** 2 for o in opt.outcomes)
@@ -114,7 +127,6 @@ def safest_label(decision) -> str:
 
 
 def format_shares(decision, shares: dict[str, float], runs: int) -> str:
-    """One run: the option picked. More runs: each option's share, in option order."""
     order = [o.label for o in decision.options] + ["No answer"]
     picked = [label for label in order if shares.get(label, 0) > 0]
     if runs == 1:
@@ -123,7 +135,6 @@ def format_shares(decision, shares: dict[str, float], runs: int) -> str:
 
 
 def check_own_instructions(text: str) -> tuple[bool, str]:
-    """Run the instruction check once per distinct text; log rejections."""
     checks = st.session_state.instruction_checks
     if text not in checks:
         checks[text] = check_instructions(text)
@@ -147,7 +158,7 @@ def what_came_up(outcome: dict) -> str:
         return f"${outcome['payoff']:.2f} for certain"
     label, p = outcome["outcome_label"], outcome["probability"]
     if label and outcome["category"] == "Ambiguity":
-        return f"A {label.lower()}"  # no chance shown when the odds are unknown
+        return f"A {label.lower()}"
     chance = "one in three" if abs(p - 1 / 3) < 1e-9 else f"{round(p * 100)}% chance"
     if label:
         return f"{label} ({chance})"
@@ -159,27 +170,31 @@ def what_came_up(outcome: dict) -> str:
 # =====================================================================
 st.title("Agent Delegation Lab")
 
+cond: Condition = st.session_state.condition
+
 with st.expander("About this experiment", expanded=True):
-    st.markdown(esc(
+    intro = (
         "You choose an AI agent to make 8 money decisions for you. "
         "You keep what the agent earns, plus any budget you do not spend.\n\n"
         f"You start with a budget of ${BASE_BUDGET:.0f}. "
         "You can spend it in two ways.\n\n"
         "- You can test agents on practice questions before you choose.\n"
-        "- You can pay to pick which preset agent you get, or to write your "
+        "- You can pay to pick which agent you get, or to write your "
         "own agent's instructions.\n\n"
         "How it works:\n\n"
         "1. Read the 8 decisions your agent will face. You can read them, "
         "but you cannot test any agent on them.\n"
         "2. Test agents on practice questions. This step is optional, and "
-        "each test costs money. An agent can answer the same question "
-        "differently each time, so tests show how often it picks each option.\n"
+        "each test costs money. Testing the Platform Agent is free.\n"
         "3. Choose a control tier and set up your agent.\n"
         "4. Your agent makes each of the 8 decisions once, and each lottery "
-        "is drawn once. You see what it chose, what came up, and what you earned.\n\n"
-        "We study how much people pay to test and control an AI agent, and "
-        "whether testing changes which agent they pick."
-    ))
+        "is drawn once. You see what it chose, what came up, and what you earned."
+    )
+    if cond.replacement_type != "none":
+        intro += (
+            "\n\n**Important:** " + cond.disclosure
+        )
+    st.markdown(esc(intro))
 
 # Budget display
 budget = st.session_state.budget_remaining
@@ -213,24 +228,33 @@ if not st.session_state.committed:
     st.subheader("Step 2. Test agents on practice questions (optional)")
     cat_price, near_price = TEST_PRICES["category"], TEST_PRICES["near"]
     st.markdown(esc(
-        "You can test any agent on practice questions before you choose. "
+        "You can test agents on practice questions before you choose. "
         "The practice questions are different from the 8 decisions above.\n\n"
         "Each run is a new answer from the agent. The same agent can answer "
         "the same question differently, so more runs show how consistent it "
         "is. At the end, your agent answers each of the 8 decisions only once.\n\n"
-        "You pay for each agent, on each question, for each run. "
-        "Here are the prices for one run:\n\n"
-        "- Category banks hold questions of the same kinds as the 8 decisions, "
-        f"with different amounts and odds. One run costs ${cat_price:.2f} "
-        f"for a preset agent and ${test_price('category', True):.2f} for your own agent.\n"
-        "- Close variant banks hold small changes to one of the 8 decisions. "
-        f"One run costs ${near_price:.2f} for a preset agent and "
-        f"${test_price('near', True):.2f} for your own agent."
+        "**Testing the Platform Agent is free.** Testing preset or custom "
+        "agents costs money per agent, per question, per run:\n\n"
+        "- Category banks: "
+        f"${cat_price:.2f} per run (preset), "
+        f"${test_price('category', True):.2f} per run (custom).\n"
+        "- Close variant banks: "
+        f"${near_price:.2f} per run (preset), "
+        f"${test_price('near', True):.2f} per run (custom)."
     ))
 
     col_agents, col_bank = st.columns(2)
 
     with col_agents:
+        st.markdown("**Agents to test**")
+
+        include_platform = st.checkbox(
+            "Platform Agent (free)",
+            value=True,
+            key="test_platform",
+            help=esc(PLATFORM_AGENT["description"]),
+        )
+
         chosen_presets = st.multiselect(
             "Preset agents to test", list(PRESETS), key="test_presets"
         )
@@ -238,6 +262,7 @@ if not st.session_state.committed:
             for name, preset in PRESETS.items():
                 st.markdown(f"**{name}**. {esc(preset['description'])}")
                 st.code(preset["instruction"], language=None)
+
         own_text = st.text_area(
             "Your own agent's instructions (optional)",
             height=150,
@@ -287,7 +312,9 @@ if not st.session_state.committed:
         )
         st.caption("A test with 100 runs can take a few minutes.")
 
-    n_agents = len(chosen_presets) + (1 if own_text else 0)
+    # Cost: Platform Agent is free, presets and custom cost money
+    n_paid_agents = len(chosen_presets) + (1 if own_text else 0)
+    n_total_agents = n_paid_agents + (1 if include_platform else 0)
     cost = round(
         len(problems)
         * runs
@@ -299,21 +326,30 @@ if not st.session_state.committed:
     )
     can_afford_test = cost <= st.session_state.budget_remaining + 1e-9
 
-    if n_agents == 0:
+    if n_total_agents == 0:
         st.caption("Pick at least one agent to test.")
     elif not problems:
         st.caption("Pick at least one question.")
     else:
-        st.markdown(esc(
-            f"This test runs {plural(n_agents, 'agent')} {plural(runs, 'time')} "
-            f"on each of {plural(len(problems), 'question')} and costs ${cost:.2f}."
-        ))
+        if cost > 0:
+            st.markdown(esc(
+                f"This test runs {plural(n_total_agents, 'agent')} {plural(runs, 'time')} "
+                f"on each of {plural(len(problems), 'question')}. "
+                f"Cost: ${cost:.2f}"
+                + (" (Platform Agent is free)." if include_platform else ".")
+            ))
+        else:
+            st.markdown(esc(
+                f"This test runs the Platform Agent {plural(runs, 'time')} "
+                f"on each of {plural(len(problems), 'question')}. Free."
+            ))
         if not can_afford_test:
-            st.caption("You do not have enough budget for this test.")
+            st.caption("You do not have enough budget for the paid agents in this test.")
 
+    button_label = esc(f"Run test (${cost:.2f})") if cost > 0 else "Run test (free)"
     if st.button(
-        esc(f"Run test (${cost:.2f})"),
-        disabled=not (n_agents and problems and can_afford_test),
+        button_label,
+        disabled=not (n_total_agents and problems and can_afford_test),
         width="stretch",
     ):
         blocked = False
@@ -337,34 +373,56 @@ if not st.session_state.committed:
 
         if not blocked:
             versions = st.session_state.own_agent_versions
-            agent_specs = [
-                {"label": name, "preset": name, "instruction": PRESETS[name]["instruction"]}
-                for name in chosen_presets
-            ]
+            agent_specs = []
+
+            if include_platform:
+                agent_specs.append({
+                    "label": PLATFORM_AGENT_LABEL,
+                    "preset": "platform",
+                    "instruction": PLATFORM_AGENT["instruction"],
+                    "is_platform": True,
+                })
+            for name in chosen_presets:
+                agent_specs.append({
+                    "label": name,
+                    "preset": name,
+                    "instruction": PRESETS[name]["instruction"],
+                    "is_platform": False,
+                })
             if own_text:
                 own_label = versions.get(own_text, f"{OWN_AGENT} v{len(versions) + 1}")
-                agent_specs.append(
-                    {"label": own_label, "preset": None, "instruction": own_text}
-                )
-            agents = [
-                create_agent(s["label"], preset_name=s["preset"])
-                if s["preset"]
-                else create_agent(s["label"], custom_instruction=s["instruction"])
-                for s in agent_specs
-            ]
+                agent_specs.append({
+                    "label": own_label,
+                    "preset": None,
+                    "instruction": own_text,
+                    "is_platform": False,
+                })
 
-            st.session_state.budget_remaining = round(
-                st.session_state.budget_remaining - cost, 2
-            )
+            agents = []
+            for s in agent_specs:
+                if s.get("is_platform"):
+                    agents.append(create_platform_agent(s["label"]))
+                elif s["preset"]:
+                    agents.append(create_agent(s["label"], preset_name=s["preset"]))
+                else:
+                    agents.append(create_agent(s["label"], custom_instruction=s["instruction"]))
+
+            if cost > 0:
+                st.session_state.budget_remaining = round(
+                    st.session_state.budget_remaining - cost, 2
+                )
             with st.spinner("Your agents are answering the practice questions..."):
                 try:
                     results = run_tests(agents, problems, runs=runs)
                 except Exception as exc:
-                    st.session_state.budget_remaining = round(
-                        st.session_state.budget_remaining + cost, 2
-                    )
+                    if cost > 0:
+                        st.session_state.budget_remaining = round(
+                            st.session_state.budget_remaining + cost, 2
+                        )
                     st.error(f"The test failed, and you were not charged. {exc}")
                 else:
+                    if include_platform:
+                        st.session_state.platform_agent_tested = True
                     if own_text:
                         versions[own_text] = own_label
                         st.session_state.last_own_instruction = own_text
@@ -389,6 +447,7 @@ if not st.session_state.committed:
                                 "runs": runs,
                                 "cost": cost,
                                 "budget_after": st.session_state.budget_remaining,
+                                "included_platform_agent": include_platform,
                             },
                             results={
                                 label: r["choice_runs"] for label, r in results.items()
@@ -408,9 +467,14 @@ if not st.session_state.committed:
         ):
             with st.container(border=True):
                 st.markdown(f"##### Test {n}")
+                cost_note = (
+                    f"Cost ${record['cost']:.2f}."
+                    if record["cost"] > 0
+                    else "Free (Platform Agent only)."
+                )
                 st.caption(esc(
                     f"{record['bank_name']}. {plural(len(record['problems']), 'question')}, "
-                    f"{plural(record['runs'], 'run')} per question. Cost ${record['cost']:.2f}."
+                    f"{plural(record['runs'], 'run')} per question. {cost_note}"
                 ))
                 rows = []
                 for j, decision in enumerate(record["problems"]):
@@ -476,7 +540,9 @@ if not st.session_state.committed:
             width="stretch",
         )
 
-    # ---- Commit to tier ----
+    # =====================================================================
+    # STEP 3: Choose a control tier
+    # =====================================================================
     st.divider()
     st.subheader("Step 3. Choose a control tier")
     st.markdown(
@@ -514,7 +580,7 @@ if not st.session_state.committed:
                 st.rerun()
 
 # =====================================================================
-# STEP 3: Configure agent (after commitment)
+# STEP 3b: Configure agent (after commitment, before run)
 # =====================================================================
 if st.session_state.committed and st.session_state.session_results is None:
     selected_tier = st.session_state.selected_tier
@@ -570,11 +636,41 @@ if st.session_state.committed and st.session_state.session_results is None:
 
     st.divider()
 
+    # ---- Swap condition disclosure ----
+    if cond.replacement_type != "none":
+        st.subheader("Agent replacement risk")
+        with st.container(border=True):
+            st.warning(cond.disclosure)
+            if cond.replacement_type == "opposite":
+                st.caption(
+                    "The opposite agent reverses your agent's strategy. "
+                    "If your agent plays it safe, the replacement takes risks, "
+                    "and vice versa."
+                )
+            elif cond.replacement_type == "slight":
+                st.caption(
+                    "The slightly different agent follows a strategy close to "
+                    "yours, but with a mild preference for safer options in "
+                    "close calls."
+                )
+            elif cond.replacement_type == "unknown":
+                st.caption(
+                    "You will not know what strategy the replacement agent "
+                    "uses. It could be similar to yours, very different, "
+                    "or anything in between."
+                )
+        st.divider()
+
     # ---- Run button ----
     st.subheader("Step 4. Send your agent to make the 8 decisions")
     st.markdown(
         "Your agent answers each decision once, and each lottery is drawn once."
     )
+    if cond.replacement_type != "none":
+        st.caption(
+            "Some decisions may be answered by the replacement agent. "
+            "You will see which ones after the results."
+        )
 
     run_clicked = st.button(
         "Run all 8 decisions",
@@ -583,6 +679,7 @@ if st.session_state.committed and st.session_state.session_results is None:
     )
 
     if run_clicked:
+        # Build user agent
         if selected_tier == "Custom":
             instruction = agent_config["instruction"].strip()
             if not instruction:
@@ -600,7 +697,7 @@ if st.session_state.committed and st.session_state.session_results is None:
                     f"Change them and try again. {reason}"
                 ))
                 st.stop()
-            agent = create_agent("My_Agent", custom_instruction=instruction)
+            user_agent = create_agent("My_Agent", custom_instruction=instruction)
             display_name = "Custom Agent"
         else:
             preset = (
@@ -608,12 +705,27 @@ if st.session_state.committed and st.session_state.session_results is None:
                 if selected_tier == "Default"
                 else agent_config["preset"]
             )
-            agent = create_agent("My_Agent", preset_name=preset)
+            user_agent = create_agent("My_Agent", preset_name=preset)
             display_name = preset
+
+        # Determine swaps and run
+        swaps = cond.decide_swaps(len(DECISIONS))
+        st.session_state.swap_decisions = swaps
+        n_swapped = sum(swaps)
 
         with st.spinner("Your agent is making the 8 decisions..."):
             try:
-                result = run_session(agent)
+                if n_swapped > 0:
+                    replacement = cond.build_replacement(agent_config)
+                    result = run_session_with_swaps(
+                        user_agent, replacement, swaps,
+                    )
+                else:
+                    result = run_session(user_agent)
+                    # Normalise shape: add swap fields
+                    result["swapped"] = [False] * len(DECISIONS)
+                    result["replacement_agent_name"] = None
+                    result["replacement_choices"] = {}
             except Exception as exc:
                 st.error(f"Error running decisions: {exc}")
                 st.exception(exc)
@@ -626,6 +738,8 @@ if st.session_state.committed and st.session_state.session_results is None:
             "budget_kept": budget_kept,
             "tier": selected_tier,
             "agent_config": agent_config,
+            "condition": cond.to_dict(),
+            "n_swapped": n_swapped,
         }
 
         try:
@@ -640,12 +754,17 @@ if st.session_state.committed and st.session_state.session_results is None:
                     "banks_tested": [
                         r["bank_key"] for r in st.session_state.test_history
                     ],
+                    "platform_agent_tested": st.session_state.platform_agent_tested,
+                    "condition": cond.to_dict(),
+                    "swaps": swaps,
+                    "n_swapped": n_swapped,
                 },
                 results={
                     "choices": result["choices"],
                     "outcomes": result["outcomes"],
                     "game_earnings": game_earnings,
                     "total_payout": budget_kept + game_earnings,
+                    "replacement_choices": result.get("replacement_choices", {}),
                 },
             )
         except Exception:
@@ -662,27 +781,46 @@ if st.session_state.session_results is not None:
     budget_kept = sr["budget_kept"]
     game_earnings = sum(o["payoff"] for o in outcomes)
     test_spent = sum(r["cost"] for r in st.session_state.test_history)
+    swapped_flags = sr["result"].get("swapped", [False] * len(outcomes))
+    n_swapped = sum(swapped_flags)
 
     st.divider()
     st.header("Results")
-    st.markdown(esc(
-        f"Your agent was {sr['display_name']}. It answered each decision once, "
-        "and each lottery was drawn once."
-    ))
 
-    st.dataframe(
-        [
-            {
-                "Decision": f"{i}. {o['title']}",
-                "Your agent chose": o["chosen"],
-                "What came up": what_came_up(o),
-                "Payoff": f"${o['payoff']:.2f}",
-            }
-            for i, o in enumerate(outcomes, 1)
-        ],
-        hide_index=True,
-        width="stretch",
-    )
+    st.markdown(esc(
+        f"Your agent was **{sr['display_name']}**. "
+        "It answered each decision once, and each lottery was drawn once."
+    ))
+    if n_swapped > 0:
+        repl_type = cond.replacement_type
+        if repl_type == "unknown":
+            repl_label = "a different agent"
+        elif repl_type == "opposite":
+            repl_label = "the opposite agent"
+        elif repl_type == "slight":
+            repl_label = "the slightly different agent"
+        else:
+            repl_label = "a replacement agent"
+        st.warning(
+            f"{n_swapped} of 8 decisions were made by {repl_label} "
+            f"instead of your chosen agent. These are marked below."
+        )
+
+    # Results table with swap indicators
+    result_rows = []
+    for i, o in enumerate(outcomes, 1):
+        was_swapped = swapped_flags[i - 1] if i - 1 < len(swapped_flags) else False
+        row = {
+            "Decision": f"{i}. {o['title']}",
+            "Your agent chose": o["chosen"],
+            "What came up": what_came_up(o),
+            "Payoff": f"${o['payoff']:.2f}",
+        }
+        if cond.replacement_type != "none":
+            row["Agent"] = "Replacement" if was_swapped else "Yours"
+        result_rows.append(row)
+
+    st.dataframe(result_rows, hide_index=True, width="stretch")
 
     st.subheader("Scorecard")
     sc1, sc2, sc3, sc4, sc5 = st.columns(5)
@@ -693,6 +831,37 @@ if st.session_state.session_results is not None:
     sc5.metric("Game Earnings", f"${game_earnings:.2f}")
 
     st.markdown(esc(f"### Total Payout: ${budget_kept + game_earnings:.2f}"))
+
+    # ---- Condition debrief ----
+    if cond.replacement_type != "none":
+        with st.expander("About the replacement agent"):
+            actual_p = cond._actual_prob
+            st.markdown(
+                f"**Your condition:** {cond.label}\n\n"
+                + (
+                    f"The actual swap probability for your session was "
+                    f"{round(actual_p * 100)}%."
+                    if actual_p is not None and not cond.prob_known
+                    else ""
+                )
+                + f"\n\n{n_swapped} of 8 decisions were made by the replacement agent."
+            )
+            if cond.replacement_type == "opposite":
+                preset = sr["agent_config"].get("preset")
+                from conditions import PRESET_OPPOSITES
+                if preset and preset in PRESET_OPPOSITES:
+                    opp = PRESET_OPPOSITES[preset]
+                    st.markdown(
+                        f"Your agent was **{preset}**. The opposite agent was "
+                        f"**{opp}**: *\"{esc(PRESETS[opp]['description'])}\"*"
+                    )
+            elif cond.replacement_type == "unknown":
+                repl_name = sr["result"].get("replacement_agent_name")
+                if repl_name:
+                    st.markdown(
+                        "The replacement agent's identity is revealed after the "
+                        "experiment. In a live study, this would remain hidden."
+                    )
 
     # ---- Start over ----
     st.divider()
