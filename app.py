@@ -53,6 +53,12 @@ RUN_CHOICES = [1, 10, 100]
 OWN_AGENT = "My agent"
 PLATFORM_AGENT_LABEL = "Platform Agent"
 
+# ---- payout ----
+# One random decision is selected after the run. Real payout =
+# (budget_remaining + that decision's payoff) * PAYOUT_RATE.
+# With avg experimental total ~$12-15, rate of 0.25 targets ~$3 real.
+PAYOUT_RATE = 0.25  # real dollars per experimental dollar
+
 TIER_COSTS = {
     "Default": 0.00,
     "Choose": 1.00,
@@ -173,14 +179,21 @@ st.title("Agent Delegation Lab")
 cond: Condition = st.session_state.condition
 
 with st.expander("About this experiment", expanded=True):
+    rate_label = f"{round(PAYOUT_RATE * 100)}c"
     intro = (
-        "You choose an AI agent to make 8 money decisions for you. "
-        "You keep what the agent earns, plus any budget you do not spend.\n\n"
-        f"You start with a budget of ${BASE_BUDGET:.0f}. "
-        "You can spend it in two ways.\n\n"
-        "- You can test agents on practice questions before you choose.\n"
-        "- You can pay to pick which agent you get, or to write your "
+        "You choose an AI agent to make 8 money decisions for you.\n\n"
+        f"You start with a budget of ${BASE_BUDGET:.0f} in experimental dollars. "
+        "You can spend it in two ways:\n\n"
+        "- Test agents on practice questions before you choose.\n"
+        "- Pay to pick which agent you get, or to write your "
         "own agent's instructions.\n\n"
+        "**How you get paid:** After your agent makes the 8 decisions, "
+        "one decision is randomly selected. Your real payment is your "
+        "remaining budget plus the payoff from that one decision, "
+        f"converted at **{rate_label} per experimental dollar** "
+        f"(${PAYOUT_RATE:.2f} real for every $1.00 in the experiment). "
+        "Because any decision could be the one that counts, each one "
+        "matters equally.\n\n"
         "How it works:\n\n"
         "1. Read the 8 decisions your agent will face. You can read them, "
         "but you cannot test any agent on them.\n"
@@ -188,7 +201,7 @@ with st.expander("About this experiment", expanded=True):
         "each test costs money. Testing the Platform Agent is free.\n"
         "3. Choose a control tier and set up your agent.\n"
         "4. Your agent makes each of the 8 decisions once, and each lottery "
-        "is drawn once. You see what it chose, what came up, and what you earned."
+        "is drawn once. One decision is randomly selected and paid out for real."
     )
     if cond.replacement_type != "none":
         intro += (
@@ -732,6 +745,13 @@ if st.session_state.committed and st.session_state.session_results is None:
                 st.stop()
 
         game_earnings = sum(o["payoff"] for o in result["outcomes"])
+
+        # Randomly select one decision for real payout
+        selected_idx = random.randrange(len(result["outcomes"]))
+        selected_payoff = result["outcomes"][selected_idx]["payoff"]
+        experimental_total = budget_kept + selected_payoff
+        real_payout = round(experimental_total * PAYOUT_RATE, 2)
+
         st.session_state.session_results = {
             "result": result,
             "display_name": display_name,
@@ -740,6 +760,9 @@ if st.session_state.committed and st.session_state.session_results is None:
             "agent_config": agent_config,
             "condition": cond.to_dict(),
             "n_swapped": n_swapped,
+            "selected_decision_idx": selected_idx,
+            "selected_payoff": selected_payoff,
+            "real_payout": real_payout,
         }
 
         try:
@@ -763,7 +786,11 @@ if st.session_state.committed and st.session_state.session_results is None:
                     "choices": result["choices"],
                     "outcomes": result["outcomes"],
                     "game_earnings": game_earnings,
-                    "total_payout": budget_kept + game_earnings,
+                    "selected_decision_idx": selected_idx,
+                    "selected_payoff": selected_payoff,
+                    "experimental_total": experimental_total,
+                    "real_payout": real_payout,
+                    "payout_rate": PAYOUT_RATE,
                     "replacement_choices": result.get("replacement_choices", {}),
                 },
             )
@@ -806,12 +833,21 @@ if st.session_state.session_results is not None:
             f"instead of your chosen agent. These are marked below."
         )
 
-    # Results table with swap indicators
+    # Payout selection
+    selected_idx = sr["selected_decision_idx"]
+    selected_payoff = sr["selected_payoff"]
+    real_payout = sr["real_payout"]
+
+    # Results table with swap and selection indicators
     result_rows = []
     for i, o in enumerate(outcomes, 1):
         was_swapped = swapped_flags[i - 1] if i - 1 < len(swapped_flags) else False
+        is_selected = (i - 1) == selected_idx
+        decision_label = f"{i}. {o['title']}"
+        if is_selected:
+            decision_label += "  ★"
         row = {
-            "Decision": f"{i}. {o['title']}",
+            "Decision": decision_label,
             "Your agent chose": o["chosen"],
             "What came up": what_came_up(o),
             "Payoff": f"${o['payoff']:.2f}",
@@ -822,15 +858,29 @@ if st.session_state.session_results is not None:
 
     st.dataframe(result_rows, hide_index=True, width="stretch")
 
-    st.subheader("Scorecard")
-    sc1, sc2, sc3, sc4, sc5 = st.columns(5)
-    sc1.metric("Starting Budget", f"${BASE_BUDGET:.2f}")
-    sc2.metric("Tests Spent", f"${test_spent:.2f}")
-    sc3.metric("Tier Cost", f"${TIER_COSTS[sr['tier']]:.2f}")
-    sc4.metric("Budget Kept", f"${budget_kept:.2f}")
-    sc5.metric("Game Earnings", f"${game_earnings:.2f}")
+    selected_title = outcomes[selected_idx]["title"]
+    st.info(esc(
+        f"★ **Decision {selected_idx + 1} ({selected_title})** was randomly "
+        f"selected. Its payoff of ${selected_payoff:.2f} determines your "
+        f"real payment."
+    ))
 
-    st.markdown(esc(f"### Total Payout: ${budget_kept + game_earnings:.2f}"))
+    st.subheader("Scorecard")
+
+    st.markdown(esc(
+        f"| | Experimental | Real ({round(PAYOUT_RATE * 100)}c per $1) |\n"
+        f"|---|---|---|\n"
+        f"| Starting budget | ${BASE_BUDGET:.2f} | |\n"
+        f"| Tests | -${test_spent:.2f} | |\n"
+        f"| Tier ({sr['tier']}) | -${TIER_COSTS[sr['tier']]:.2f} | |\n"
+        f"| **Budget remaining** | **${budget_kept:.2f}** | |\n"
+        f"| Selected decision payoff | +${selected_payoff:.2f} | |\n"
+        f"| **Experimental total** | **${budget_kept + selected_payoff:.2f}** | |\n"
+        f"| | | |\n"
+        f"| **Your real payment** | | **${real_payout:.2f}** |"
+    ))
+
+    st.markdown(esc(f"### Your Payment: ${real_payout:.2f}"))
 
     # ---- Condition debrief ----
     if cond.replacement_type != "none":
